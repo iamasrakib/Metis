@@ -571,7 +571,7 @@ Bengal model on Colab's free T4 GPU and saves every checkpoint straight to your
 
 **8 cells, run top to bottom:**
 1. Mount Google Drive.
-2. Clone this repo with a GitHub Personal Access Token (the repo is private).
+2. Clone this repo (it's public — no login needed).
 3. Install dependencies.
 4. Generate the West Bengal dataset.
 5. Link the checkpoint folder into Drive — checkpoints save there as training runs.
@@ -579,14 +579,11 @@ Bengal model on Colab's free T4 GPU and saves every checkpoint straight to your
 7. Confirm the checkpoints are in `MyDrive/Metis/`.
 8. (Optional) Generate a sample from the trained model.
 
-**Open the notebook (private repo):**
-- Colab → **File → Open notebook → GitHub** → sign in → select `iamasrakib/Metis` →
-  `Metis_Colab_Training.ipynb`, or
-- Download [`Metis_Colab_Training.ipynb`](Metis_Colab_Training.ipynb) from GitHub and
-  drag it onto Colab.
+**Open the notebook — one click:**
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iamasrakib/Metis/blob/main/Metis_Colab_Training.ipynb)
 
-**One-time token setup:** GitHub → Settings → Developer settings → Personal access
-tokens → Tokens (classic) → Generate new token → tick **repo** → paste it into Step 2.
+Or: Colab → **File → Open notebook → GitHub** → select `iamasrakib/Metis` →
+`Metis_Colab_Training.ipynb`.
 
 Switch dataset/model? Uncomment another generator in Step 4 and change `CKPT_DIR` /
 `MAX_ITERS` in Steps 5–6 (the notebook lists each training script's matching
