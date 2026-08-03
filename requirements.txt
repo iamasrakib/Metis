@@ -1,0 +1,30 @@
+# Core
+torch>=2.4
+numpy
+
+# Training UX
+tqdm
+
+# Visualization (optional)
+matplotlib
+
+# Tokenization
+tiktoken>=0.5.0
+tokenizers>=0.15.0
+
+# Experiment tracking (optional)
+wandb>=0.16.0
+
+# API server (optional)
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+
+# Web UI (optional)
+gradio>=4.0.0
+
+# Quantization (optional)
+bitsandbytes>=0.41.0
+
+# Testing
+pytest>=7.0.0
