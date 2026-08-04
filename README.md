@@ -374,6 +374,7 @@ train(config, resume=False)
 | Command | Description |
 |---------|-------------|
 | `metis train` | Train a model (with BPE/char tokenizer, MoE, DDP, EMA, W&B) |
+| `metis distill` | Distill from an API teacher — train forever, auto-resume |
 | `metis generate` | Generate text from a single prompt |
 | `metis chat` | Interactive terminal chat |
 | `metis serve` | REST API server (FastAPI, OpenAI-compatible) |
@@ -588,6 +589,65 @@ Or: Colab → **File → Open notebook → GitHub** → select `iamasrakib/Metis
 Switch dataset/model? Uncomment another generator in Step 4 and change `CKPT_DIR` /
 `MAX_ITERS` in Steps 5–6 (the notebook lists each training script's matching
 checkpoint dir).
+
+The notebook also includes **Step 13 — Distill from an API**: set your teacher
+credentials, link `checkpoints_distill/` into Drive, and let it train forever.
+
+---
+
+## Distillation (train forever from an API)
+
+`metis distill` trains Metis **continuously** on text written by a frontier
+teacher model (ChatGPT / DeepSeek / Claude class) reached through an
+OpenAI-compatible API — the classic way to *distill* knowledge into a small
+model. The loop never stops on its own; it keeps writing and learning until you
+stop it. **Stopping and restarting resumes automatically — no setup.**
+
+```bash
+# 1. Point at your teacher (env vars, or --teacher-* flags)
+export METIS_TEACHER_BASE_URL="https://your-gateway.example/v1"
+export METIS_TEACHER_API_KEY="sk-..."
+export METIS_TEACHER_MODEL="deepseek-chat"
+
+# 2. Verify the connection with one call (adjust the contract if needed)
+metis distill --test-teacher
+
+# 3. Train forever
+metis distill --checkpoint-dir checkpoints_distill --preset tiny --tokenizer cl100k_base
+```
+
+**Stop / resume:**
+
+- **Stop:** press `Ctrl+C` (saves first), or create a file named `STOP` in the
+  checkpoint dir.
+- **Resume:** re-run the same command. It reloads `latest_checkpoint.pt`,
+  `distill_state.json`, and `tokenizer.json` and continues exactly where it
+  stopped. This works across days, machines, and Colab reconnects (the notebook
+  symlinks the checkpoint dir into Drive).
+- A trained checkpoint dir is a normal Metis checkpoint — chat with it via
+  `metis chat --checkpoint-dir checkpoints_distill`.
+
+**How it works:** each iteration asks the teacher to write a chunk of prose
+about a topic (rotating through `--topic-file` if given), then Metis trains a
+few optimizer steps on that text (its normal next-token objective — true
+logit-level distillation is impossible across different tokenizers, so this is
+the standard "text distillation"). Tokenizer is fit **once** and reused, so the
+vocabulary never drifts on an endless stream. On CUDA, mixed precision follows
+`get_amp_dtype` (fp16 on Turing/T4, bf16 on Ampere+).
+
+**Pacing / cost guards** (an infinite loop hits a paid API):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--max-tokens` | 1024 | Max tokens per teacher call |
+| `--min-sleep` | 1.0 | Min seconds between calls |
+| `--steps-per-call` | 4 | Optimizer steps per call |
+| `--budget-tokens` | 0 | Stop after this many teacher tokens (0 = unlimited) |
+| `--save-every` | 50 | Checkpoint + state save interval (steps) |
+
+Other useful flags: `--topic "animals"`, `--topic-file topics.txt`,
+`--tokenizer char --seed-data corpus.txt` (fit a char vocab once), `--no-resume`
+(start fresh), `--mock` (offline teacher for testing).
 
 ---
 

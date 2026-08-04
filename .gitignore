@@ -30,6 +30,7 @@ Thumbs.db
 # Training artifacts
 checkpoints/
 checkpoints_*/
+cache/
 logs/
 *.pt
 *.pth

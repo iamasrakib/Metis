@@ -4,6 +4,7 @@
 Commands:
 
     metis train       Train a model from a text dataset
+    metis distill     Train forever from an API teacher (distillation)
     metis generate    Generate text from a single prompt
     metis chat        Interactive streaming chat
     metis serve       Start a REST API server (FastAPI)
@@ -22,6 +23,7 @@ import sys
 from .config import PRESETS, ModelConfig, setup_logging
 from .data import CharTokenizer, create_dataloader, load_text, train_val_split
 from .generate import chat, generate_text, load_model_and_tokenizer
+from .teacher import TeacherError
 from .training import find_lr
 from .training import train as run_training
 
@@ -262,6 +264,88 @@ def _build_findlr_parser(subparsers) -> None:
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
 
+def _build_distill_parser(subparsers) -> None:
+    p = subparsers.add_parser(
+        "distill",
+        help="Train forever from an API teacher (distillation)",
+        description=(
+            "Train Μῆτις continuously on text written by a frontier teacher "
+            "model reached through an OpenAI-compatible API (your omniroute "
+            "gateway). Runs until you stop it; restarting the same command "
+            "resumes automatically."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Teacher API (env vars, or --teacher-* flags):\n"
+            "  METIS_TEACHER_BASE_URL   e.g. https://your-gateway.example/v1\n"
+            "  METIS_TEACHER_API_KEY\n"
+            "  METIS_TEACHER_MODEL      e.g. deepseek-chat\n"
+            "  METIS_TEACHER_TIMEOUT    seconds per call (default 240)\n"
+            "\n"
+            "Stop anytime: Ctrl+C, or create a file named STOP in the "
+            "checkpoint dir. Re-run the same command to resume - no setup.\n"
+            "\n"
+            "Examples:\n"
+            "  metis distill --checkpoint-dir checkpoints_distill --preset tiny\n"
+            "  metis distill --checkpoint-dir checkpoints_distill --test-teacher\n"
+            "  metis distill --checkpoint-dir ckpt --mock --max-steps 10\n"
+            "  metis distill --checkpoint-dir ckpt --topic animals --topic-file topics.txt\n"
+        ),
+    )
+    _add_common(p)
+    # Distillation runs are long-lived and users watch the log: default to INFO.
+    p.set_defaults(log_level="INFO")
+    p.add_argument("--preset", type=str, choices=list(PRESETS.keys()), default=None,
+                   help="Model-size preset (tiny/small/medium/large)")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Micro-batch size (sequences per forward; default from preset)")
+    p.add_argument("--seq-len", type=int, default=None,
+                   help="Sequence length / context window (default from preset)")
+    p.add_argument("--grad-accum", type=int, default=None,
+                   help="Gradient accumulation steps; effective batch = "
+                        "batch-size * grad-accum (default from preset)")
+    p.add_argument("--tokenizer", type=str, default=None,
+                   help="Tokenizer: cl100k_base (recommended, fixed vocab) | "
+                        "char (fit once from --seed-data) | p50k_base | o200k_base "
+                        "(default: cl100k_base)")
+    p.add_argument("--seed-data", type=str, default=None,
+                   help="Corpus file used to fit a char tokenizer once on first run")
+    p.add_argument("--topic", type=str, default="general knowledge",
+                   help="Topic the teacher should write about (default: general knowledge)")
+    p.add_argument("--topic-file", type=str, default=None,
+                   help="File with one topic per line - the teacher rotates through them")
+    p.add_argument("--max-steps", type=int, default=0,
+                   help="Stop after N optimizer steps (0 = run forever; default 0)")
+    p.add_argument("--save-every", type=int, default=50,
+                   help="Save checkpoint + state every N steps (default 50)")
+    p.add_argument("--steps-per-call", type=int, default=4,
+                   help="Optimizer steps to run per teacher API call (default 4)")
+    p.add_argument("--max-tokens", type=int, default=1024,
+                   help="Max tokens per teacher call (default 1024)")
+    p.add_argument("--min-sleep", type=float, default=1.0,
+                   help="Minimum seconds between teacher calls - pace/cost guard "
+                        "(default 1.0)")
+    p.add_argument("--budget-tokens", type=int, default=0,
+                   help="Stop after this many total teacher tokens "
+                        "(0 = unlimited; default 0)")
+    p.add_argument("--no-resume", action="store_true",
+                   help="Ignore existing checkpoints/state and start fresh")
+    p.add_argument("--mock", action="store_true",
+                   help="Use a built-in mock teacher (offline test, no API)")
+    p.add_argument("--test-teacher", action="store_true",
+                   help="Make one connectivity call to the teacher API, print "
+                        "the reply, then exit")
+    p.add_argument("--teacher-base-url", type=str, default=None,
+                   help="Overrides METIS_TEACHER_BASE_URL")
+    p.add_argument("--teacher-api-key", type=str, default=None,
+                   help="Overrides METIS_TEACHER_API_KEY")
+    p.add_argument("--teacher-model", type=str, default=None,
+                   help="Overrides METIS_TEACHER_MODEL")
+    p.add_argument("--teacher-timeout", type=int, default=None,
+                   help="Overrides METIS_TEACHER_TIMEOUT (seconds per call)")
+    return p
+
+
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 def _build_train_config(args) -> ModelConfig:
@@ -347,6 +431,73 @@ def cmd_train(args) -> int:
         _error(f"Training failed: {e}")
         return 1
     return 0
+
+
+def _build_distill_config(args) -> ModelConfig:
+    """Build the model config for distillation (preset/CLI + common overrides)."""
+    if args.preset:
+        config = ModelConfig.from_preset(args.preset, dataset_path="")
+    else:
+        config = ModelConfig(dataset_path="")
+    config.checkpoint_dir = args.checkpoint_dir
+    if args.tokenizer is not None:
+        config.tokenizer = args.tokenizer
+    if args.batch_size is not None:
+        config.micro_batch_size = args.batch_size
+    if args.seq_len is not None:
+        config.max_seq_len = args.seq_len
+    if args.grad_accum is not None:
+        config.gradient_accumulation_steps = args.grad_accum
+    if args.device:
+        config.device = args.device
+    if args.attn_backend is not None:
+        config.attn_backend = args.attn_backend
+    if args.kv_backend is not None:
+        config.kv_backend = args.kv_backend
+    config.log_level = args.log_level
+    # The distill loop is self-contained: it does not use the overlapped
+    # pipeline / CUDA graphs / packing machinery from train().
+    config.use_pipeline = False
+    config.use_cuda_graphs = False
+    config.use_packing = False
+    return config
+
+
+def _build_distill_options(args):
+    from .distill import DistillOptions
+    return DistillOptions(
+        topic=args.topic,
+        topic_file=args.topic_file,
+        seed_data=args.seed_data,
+        max_steps=args.max_steps,
+        save_every=args.save_every,
+        steps_per_call=args.steps_per_call,
+        max_tokens=args.max_tokens,
+        min_sleep=args.min_sleep,
+        budget_tokens=args.budget_tokens,
+        no_resume=args.no_resume,
+        mock=args.mock,
+        test_teacher=args.test_teacher,
+        teacher_base_url=args.teacher_base_url,
+        teacher_api_key=args.teacher_api_key,
+        teacher_model=args.teacher_model,
+        teacher_timeout=args.teacher_timeout,
+    )
+
+
+def cmd_distill(args) -> int:
+    config = _build_distill_config(args)
+    opts = _build_distill_options(args)
+    print(BANNER)
+    try:
+        from .distill import distill
+        return distill(config, opts)
+    except (FileNotFoundError, ValueError) as e:
+        _error(f"Distillation failed: {e}")
+        return 1
+    except TeacherError as e:
+        _error(f"Teacher error: {e}")
+        return 1
 
 
 def cmd_generate(args) -> int:
@@ -584,6 +735,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Commands:\n"
             "  train      Train a model from a text dataset\n"
+            "  distill    Train forever from an API teacher (distillation)\n"
             "  generate   Generate text from a single prompt\n"
             "  chat       Interactive streaming chat\n"
             "  serve      Start a REST API server (FastAPI)\n"
@@ -594,6 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
     _build_train_parser(subparsers)
+    _build_distill_parser(subparsers)
     _build_generate_parser(subparsers)
     _build_chat_parser(subparsers)
     _build_info_parser(subparsers)
@@ -614,6 +767,7 @@ def main(argv=None) -> int:
 
     handlers = {
         "train": cmd_train,
+        "distill": cmd_distill,
         "generate": cmd_generate,
         "chat": cmd_chat,
         "info": cmd_info,
