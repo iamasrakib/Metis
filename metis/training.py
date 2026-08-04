@@ -25,7 +25,7 @@ import time
 import torch
 import torch.nn as nn
 
-from .config import ModelConfig, setup_logging
+from .config import ModelConfig, get_amp_dtype, setup_logging
 from .cuda_graphs import CUDAGraphStep
 from .data import (
     BPETokenizer,
@@ -241,8 +241,7 @@ def estimate_loss(
     model.eval()
     losses = {}
     use_amp = config.device == "cuda"
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else \
-                torch.float16 if use_amp else torch.float32
+    amp_dtype = get_amp_dtype(config.device)
 
     # Use EMA weights for validation if available
     if ema is not None:
@@ -678,8 +677,7 @@ def train(config: ModelConfig, resume: bool = False) -> None:
             )
 
     use_amp = config.device.startswith("cuda")
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else \
-                torch.float16 if use_amp else torch.float32
+    amp_dtype = get_amp_dtype(config.device)
 
     # ── CUDA Graphs ──────────────────────────────────────────────────────
     # Captures the whole gradient-accumulation iteration (N × fwd+bwd) as one

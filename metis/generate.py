@@ -20,7 +20,7 @@ from collections.abc import Callable
 import torch
 from torch.nn import functional as F
 
-from .config import ModelConfig
+from .config import ModelConfig, get_amp_dtype
 from .data import BPETokenizer, CharTokenizer
 from .kv import cached_len_of  # KV cache subsystem (Phase 7)
 from .model import MetisLM
@@ -90,8 +90,7 @@ def generate_text(
     # fused attention kernels (FlashAttention / memory-efficient) engage; the
     # logits are cast back to fp32 before sampling so sampling stays exact.
     use_amp = device.startswith("cuda")
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else \
-                torch.float16 if use_amp else torch.float32
+    amp_dtype = get_amp_dtype(device)
 
     for step in range(max_new_tokens):
         # Prepare input. With a KV-cache we normally feed only the last token,

@@ -26,6 +26,7 @@ from metis.attn import (
     MATH,
     SDPA_FLASH,
     SDPA_MEM_EFFICIENT,
+    SDPA_MATH,
     causal_attention,
     detect_attention_backends,
     fused_attention_supported,
@@ -37,6 +38,39 @@ from tests.test_model import make_config
 
 CUDA = torch.cuda.is_available()
 gpu = pytest.mark.skipif(not CUDA, reason="CUDA required")
+
+
+FUSED = {FLASH_ATTN, SDPA_FLASH, SDPA_MEM_EFFICIENT}
+
+
+def bf16_fused_ok() -> bool:
+    """True if some fused kernel accepts bf16 on this build/GPU.
+
+    On Turing (e.g. Colab T4) torch's fused SDPA kernels are fp16-only, so
+    bf16 calls legitimately degrade to the SDPA math kernel instead.
+    """
+    r = detect_attention_backends()
+    return (
+        r["flash_attn"] is not None
+        or r["torch_flash_bf16"]
+        or r["torch_mem_efficient_bf16"]
+    )
+
+
+def allowed_backends(dtype: torch.dtype) -> set:
+    """Backends a call of ``dtype`` may legitimately land on (auto dispatch).
+
+    On machines with no fused kernel at all every dtype falls back to the
+    SDPA math kernel; on machines whose fused kernels are fp16-only, bf16
+    falls back to it too.
+    """
+    allowed = set(FUSED)
+    report = detect_attention_backends()
+    if not report["fused_available"]:
+        allowed.add(SDPA_MATH)
+    elif dtype == torch.bfloat16 and not bf16_fused_ok():
+        allowed.add(SDPA_MATH)
+    return allowed
 
 
 # ── Reference: exact legacy manual attention ─────────────────────────────────
@@ -85,14 +119,17 @@ class TestDetection:
         report = detect_attention_backends()
         for key in ("device", "torch", "flash_attn", "flash_attn_gqa",
                     "torch_flash", "torch_mem_efficient", "torch_math",
+                    "torch_flash_bf16", "torch_mem_efficient_bf16",
                     "fused_gqa", "recommended", "gpu_name",
                     "compute_capability", "fused_available"):
             assert key in report
         assert report["recommended"] in (
-            FLASH_ATTN, SDPA_FLASH, SDPA_MEM_EFFICIENT, MATH
+            FLASH_ATTN, SDPA_FLASH, SDPA_MEM_EFFICIENT, SDPA_MATH, MATH
         )
-        # fused_available must be consistent with the auto recommendation
-        assert report["fused_available"] == (report["recommended"] != MATH)
+        # fused_available must be consistent with the auto recommendation:
+        # "recommended" is a fused kernel iff one is available (the SDPA math
+        # fallback is not fused).
+        assert report["fused_available"] == (report["recommended"] in FUSED)
         if CUDA:
             # GPU capability detection: device name + compute capability tuple
             assert isinstance(report["gpu_name"], str) and report["gpu_name"]
@@ -264,9 +301,10 @@ class TestFusedEquivalence:
                     warnings.simplefilter("always")
                     y = causal_attention(q, k, v, n_heads=H, n_kv_heads=kv,
                                          out_backend=bl)
-                # No fallback warnings in the plain auto path
+                # No fallback warnings in the plain auto path (degradation to
+                # the SDPA math kernel is a silent selection, not a fallback)
                 assert not [w for w in record if issubclass(w.category, UserWarning)]
-                assert bl[0] in (SDPA_FLASH, SDPA_MEM_EFFICIENT, FLASH_ATTN)
+                assert bl[0] in allowed_backends(dt)
                 ref = math_attention(q, _repeat_kv(k, H // kv),
                                      _repeat_kv(v, H // kv))
                 # fp16/bf16 fused kernels accumulate in fp32; residual
@@ -275,6 +313,41 @@ class TestFusedEquivalence:
                                       rtol=2e-2, atol=2e-2), (
                     f"dtype={dt} kv={kv} backend={bl[0]}"
                 )
+
+    def test_bf16_mem_efficient_no_kernel_fixed(self):
+        """Regression: bf16 auto dispatch must never raise "No available kernel".
+
+        On Turing (Colab T4) the fused kernels are fp16-only, so a bf16 call
+        that resolved to ``SDPA_MEM_EFFICIENT`` used to be pinned to a kernel
+        that rejected bf16 — leaving no kernel and crashing. It must now
+        degrade to the SDPA math kernel (or MATH) and stay numerically correct.
+        This mirrors the failing packed-training path (block-diagonal mask).
+        """
+        report = detect_attention_backends()
+        if report["device"] != "cuda":
+            pytest.skip("CUDA required")
+        if not report["fused_available"]:
+            pytest.skip("no fused kernel available")
+        torch.manual_seed(0)
+        B, H, T, D, n_kv = 1, 4, 64, 48, 1  # head_dim 48 like the 100M config
+        q = torch.randn(B, H, T, D, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(B, n_kv, T, D, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(B, n_kv, T, D, device="cuda", dtype=torch.bfloat16)
+        seg = torch.tril(torch.ones(T // 2, T // 2))
+        mask = torch.block_diag(seg, seg).bool() \
+            .unsqueeze(0).unsqueeze(0).cuda()  # (1, 1, T, T) packed causal
+        bl = []
+        y = causal_attention(
+            q, k, v, n_heads=H, n_kv_heads=n_kv,
+            attention_mask=mask, out_backend=bl,
+        )
+        assert y.shape == q.shape
+        assert bl[0] in allowed_backends(torch.bfloat16) | {MATH}, bl[0]
+        ref = math_attention(
+            q, _repeat_kv(k, H // n_kv), _repeat_kv(v, H // n_kv),
+            attention_mask=mask,
+        )
+        assert torch.allclose(y.float(), ref.float(), rtol=2e-2, atol=2e-2)
 
     def test_decode_equivalence(self):
         report = detect_attention_backends()
@@ -333,9 +406,7 @@ class TestFusedEquivalence:
             torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
-        assert m.layers[0].attn.last_backend in (
-            SDPA_FLASH, SDPA_MEM_EFFICIENT, FLASH_ATTN
-        )
+        assert m.layers[0].attn.last_backend in allowed_backends(torch.float16)
         for p in m.parameters():
             if p.grad is not None:
                 assert torch.isfinite(p.grad).all(), "non-finite gradient"
@@ -367,9 +438,7 @@ class TestFusedEquivalence:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             _, loss, _ = m(idx, targets=idx)
         loss.backward()
-        assert m.layers[0].attn.last_backend in (
-            SDPA_FLASH, SDPA_MEM_EFFICIENT, FLASH_ATTN
-        )
+        assert m.layers[0].attn.last_backend in allowed_backends(torch.bfloat16)
 
     def test_forced_backend_fallback(self):
         """Requesting an unavailable kernel must degrade, not crash."""
@@ -388,7 +457,7 @@ class TestFusedEquivalence:
                 y = causal_attention(q, k, v, n_heads=4, n_kv_heads=2,
                                      backend=forced, out_backend=bl)
                 assert y.shape == q.shape
-                assert bl[0] in (SDPA_FLASH, SDPA_MEM_EFFICIENT, MATH)
+                assert bl[0] in (SDPA_FLASH, SDPA_MEM_EFFICIENT, SDPA_MATH, MATH)
             warned = [w for w in record
                       if "not available" in str(w.message)]
         # This build lacks the flash kernel, so at least one fallback warning
@@ -404,7 +473,6 @@ class TestFusedEquivalence:
         and were excluded from the fused fp16/bf16 kernels. Under AMP the
         QK-norm path must engage the same fused kernel as the plain path.
         """
-        fused = {SDPA_FLASH, SDPA_MEM_EFFICIENT, FLASH_ATTN}
         for use_qk_norm in (False, True):
             cfg = make_config(d_model=64, n_heads=4, n_kv_heads=2, n_layers=1,
                               max_seq_len=64, dropout=0.0, use_flash_attn=True,
@@ -414,8 +482,9 @@ class TestFusedEquivalence:
             idx = torch.randint(0, cfg.vocab_size, (2, 16), device="cuda")
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss, _ = m(idx, targets=idx)
-            assert m.layers[0].attn.last_backend in fused, (
-                f"use_qk_norm={use_qk_norm} should use a fused kernel, "
+            assert m.layers[0].attn.last_backend in allowed_backends(torch.bfloat16), (
+                f"use_qk_norm={use_qk_norm} should engage a fast kernel (fused "
+                f"where bf16 fused is available, else the SDPA math fallback), "
                 f"got {m.layers[0].attn.last_backend}"
             )
 
@@ -430,7 +499,7 @@ class TestFusedEquivalence:
         """
         if not detect_attention_backends()["fused_available"]:
             pytest.skip("no fused kernel available")
-        fused = {SDPA_FLASH, SDPA_MEM_EFFICIENT, FLASH_ATTN}
+        fused = allowed_backends(torch.bfloat16)
         cfg = make_config(d_model=64, n_heads=4, n_kv_heads=2, n_layers=2,
                           max_seq_len=128, dropout=0.0, use_flash_attn=True)
         m = MetisLM(cfg).cuda().eval()
@@ -442,13 +511,17 @@ class TestFusedEquivalence:
             # Prefill
             _, _, cache = m(toks, targets=toks)
             assert m.layers[0].attn.last_backend in fused, (
-                f"prefill should use a fused kernel, got {m.layers[0].attn.last_backend}"
+                f"prefill should use a fused kernel (or the SDPA math fallback "
+                f"where bf16 fused is unsupported), got "
+                f"{m.layers[0].attn.last_backend}"
             )
             # Incremental decode — the regression was here
             for _ in range(3):
                 _, _, cache = m(toks[:, -1:], kv_cache=cache)
             assert m.layers[0].attn.last_backend in fused, (
-                f"decode should use a fused kernel, got {m.layers[0].attn.last_backend}"
+                f"decode should use a fused kernel (or the SDPA math fallback "
+                f"where bf16 fused is unsupported), got "
+                f"{m.layers[0].attn.last_backend}"
             )
 
         # And cached step-by-step decode still matches the full forward

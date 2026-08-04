@@ -10,7 +10,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from metis.config import ModelConfig  # noqa: E402
+from metis.config import ModelConfig, get_amp_dtype  # noqa: E402
 from metis.cuda_graphs import CUDAGraphStep  # noqa: E402
 from metis.model import MetisLM  # noqa: E402
 
@@ -40,7 +40,7 @@ def make_cfg(**kw) -> ModelConfig:
     return ModelConfig(**defaults)
 
 
-AMP = torch.bfloat16 if (CUDA and torch.cuda.is_bf16_supported()) else torch.float16
+AMP = get_amp_dtype("cuda" if CUDA else "cpu")
 
 
 def _rand_batches(cfg, seed=0):

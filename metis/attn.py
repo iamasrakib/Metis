@@ -19,7 +19,10 @@ Dispatch priority (best → worst):
   3. the exact manual math implementation (the legacy reference path).
 
 Fallback is automatic: an unavailable or ineligible kernel is skipped and the
-computation degrades to the next best backend. ``use_flash_attn=False`` (or
+computation degrades to the next best backend. Eligibility includes the call's
+dtype — on Turing GPUs the fused kernels are fp16-only, so a bf16 call there
+degrades to torch's SDPA math kernel (``SDPA_MATH``, any dtype) rather than
+crashing with "No available kernel". ``use_flash_attn=False`` (or
 ``attn_backend="math"``) pins the byte-identical manual reference, which is
 also the deterministic path for debugging and reproduction.
 
@@ -133,9 +136,11 @@ class BackendCapabilities:
     torch_version: str
     flash_attn_pkg: str | None    # installed version string, or None
     flash_attn_gqa: bool             # package supports enable_gqa
-    torch_flash: bool                # torch SDPA FLASH kernel compiled
-    torch_mem_efficient: bool        # torch SDPA EFFICIENT kernel available
+    torch_flash: bool                # torch SDPA FLASH kernel available (fp16)
+    torch_mem_efficient: bool        # torch SDPA EFFICIENT kernel available (fp16)
     torch_math: bool = True
+    torch_flash_bf16: bool = False       # FLASH kernel also accepts bf16
+    torch_mem_efficient_bf16: bool = False  # EFFICIENT kernel also accepts bf16
     fused_gqa: bool = False          # some fused kernel accepts enable_gqa
     gpu_name: str | None = None      # torch.cuda.get_device_name(0)
     compute_capability: tuple[int, int] | None = None  # e.g. (8, 6) = Ampere
@@ -154,12 +159,17 @@ def _flash_attn_version() -> str | None:
     return "unknown"
 
 
-def _probe_sdpa_kernel(backend_attr: str) -> bool:
-    """Run a tiny fp16 CUDA call pinned to one SDPA kernel; True if it works.
+def _probe_sdpa_kernel(
+    backend_attr: str, dtype: torch.dtype = torch.float16
+) -> bool:
+    """Run a tiny CUDA call pinned to one SDPA kernel; True if it works.
 
-    ``sdpa_kernel`` only allows the listed backend, so an unavailable kernel
-    raises instead of silently falling back — exactly what makes this a
-    reliable availability probe.
+    ``dtype`` probes per-dtype availability: the fused kernels are
+    fp16/bf16-only, and a given build may support only fp16 (e.g. torch's
+    memory-efficient kernel on Turing) even when the hardware can compute
+    bf16. ``sdpa_kernel`` only allows the listed backend, so an unavailable
+    kernel raises instead of silently falling back — exactly what makes this
+    a reliable availability probe.
     """
     SDPBackend, sdpa_kernel = _get_sdpa_api()
     if SDPBackend is None or sdpa_kernel is None:
@@ -168,9 +178,9 @@ def _probe_sdpa_kernel(backend_attr: str) -> bool:
     if kernel is None:
         return False
     try:
-        q = torch.ones(1, 2, 8, 16, device="cuda", dtype=torch.float16)
-        k = torch.ones(1, 2, 8, 16, device="cuda", dtype=torch.float16)
-        v = torch.ones(1, 2, 8, 16, device="cuda", dtype=torch.float16)
+        q = torch.ones(1, 2, 8, 16, device="cuda", dtype=dtype)
+        k = torch.ones(1, 2, 8, 16, device="cuda", dtype=dtype)
+        v = torch.ones(1, 2, 8, 16, device="cuda", dtype=dtype)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # dispatch emits UserWarnings on purpose
             with sdpa_kernel(kernel):
@@ -258,6 +268,12 @@ def _probe() -> BackendCapabilities:
         torch_flash=torch_flash,
         torch_mem_efficient=torch_mem_efficient,
         torch_math=True,
+        torch_flash_bf16=(
+            _probe_sdpa_kernel("FLASH_ATTENTION", dtype=torch.bfloat16) if cuda else False
+        ),
+        torch_mem_efficient_bf16=(
+            _probe_sdpa_kernel("EFFICIENT_ATTENTION", dtype=torch.bfloat16) if cuda else False
+        ),
         fused_gqa=_probe_fused_gqa() if cuda else False,
         gpu_name=torch.cuda.get_device_name(0) if cuda else None,
         compute_capability=tuple(torch.cuda.get_device_capability(0)) if cuda else None,
@@ -265,15 +281,42 @@ def _probe() -> BackendCapabilities:
     )
 
 
-def _auto_concrete(cap: BackendCapabilities) -> str:
-    """The concrete kernel ``auto`` resolves to on this machine."""
+def _fused_dtype_supported(
+    concrete: str, dtype: torch.dtype, cap: BackendCapabilities
+) -> bool:
+    """True if the fused SDPA kernel ``concrete`` accepts ``dtype``.
+
+    fp16 is supported by every fused build; bf16 support varies by build and
+    GPU (torch's memory-efficient kernel historically lacks it on Turing,
+    where ``torch.cuda.is_bf16_supported()`` still reports True). The
+    dao-AILab flash-attn package (``FLASH_ATTN``) accepts fp16 and bf16.
+    """
+    if dtype != torch.bfloat16:
+        return True
+    if concrete == SDPA_FLASH:
+        return cap.torch_flash_bf16
+    if concrete == SDPA_MEM_EFFICIENT:
+        return cap.torch_mem_efficient_bf16
+    return True  # FLASH_ATTN (package) supports bf16
+
+
+def _auto_concrete(cap: BackendCapabilities, dtype: torch.dtype | None = None) -> str:
+    """The concrete kernel ``auto`` resolves to on this machine.
+
+    ``dtype`` (default: fp16 — the probe's dtype) narrows the choice to
+    kernels that actually accept the call's dtype, so bf16 on a Turing GPU
+    (fused kernels are fp16-only there) degrades to torch's SDPA math kernel
+    instead of crashing with "No available kernel".
+    """
+    dtype = dtype if dtype is not None else torch.float16
     if cap.device == "cuda":
         if cap.flash_attn_pkg is not None:
             return FLASH_ATTN
-        if cap.torch_flash:
+        if cap.torch_flash and _fused_dtype_supported(SDPA_FLASH, dtype, cap):
             return SDPA_FLASH
-        if cap.torch_mem_efficient:
+        if cap.torch_mem_efficient and _fused_dtype_supported(SDPA_MEM_EFFICIENT, dtype, cap):
             return SDPA_MEM_EFFICIENT
+        return SDPA_MATH  # torch's SDPA math kernel accepts any dtype on CUDA
     return MATH
 
 
@@ -295,6 +338,8 @@ def detect_attention_backends() -> dict:
         "flash_attn_gqa": cap.flash_attn_gqa,
         "torch_flash": cap.torch_flash,
         "torch_mem_efficient": cap.torch_mem_efficient,
+        "torch_flash_bf16": cap.torch_flash_bf16,
+        "torch_mem_efficient_bf16": cap.torch_mem_efficient_bf16,
         "torch_math": cap.torch_math,
         "fused_gqa": cap.fused_gqa,
         "fused_available": cap.fused_available,
@@ -331,6 +376,19 @@ def _warn_unavailable(requested: str, reason: str = "") -> None:
     warnings.warn(
         f"Attention backend {requested!r} is not available{detail}; "
         f"falling back to the best available backend.",
+        stacklevel=3,
+    )
+
+
+def _warn_sdpa_fallback(backend: str, exc: Exception) -> None:
+    """Warn once that a selected kernel failed at call time."""
+    key = ("sdpa_runtime", backend)
+    if key in _warned:
+        return
+    _warned.add(key)
+    warnings.warn(
+        f"Attention backend {backend!r} failed at runtime ({exc}); "
+        f"falling back to the exact manual math reference.",
         stacklevel=3,
     )
 
@@ -399,28 +457,31 @@ def resolve_backend(
             _warn_unavailable(requested, f"dtype {dtype}")
         return MATH
 
+    # Fused-kernel selection is dtype-aware: a kernel that is compiled but
+    # rejects this dtype (bf16 on builds whose fused kernels are fp16-only)
+    # is skipped rather than selected and left to crash at call time.
     if requested == FLASH_ATTN:
         if cap.flash_attn_pkg is not None:
             return FLASH_ATTN
         _warn_unavailable(requested)
-        return _auto_concrete(cap)
+        return _auto_concrete(cap, dtype)
     if requested == SDPA_FLASH:
-        if cap.torch_flash:
+        if cap.torch_flash and _fused_dtype_supported(SDPA_FLASH, dtype, cap):
             return SDPA_FLASH
-        _warn_unavailable(requested)
-        return _auto_concrete(cap)
+        _warn_unavailable(requested, f"dtype {dtype}")
+        return _auto_concrete(cap, dtype)
     if requested == SDPA_MEM_EFFICIENT:
-        if cap.torch_mem_efficient:
+        if cap.torch_mem_efficient and _fused_dtype_supported(SDPA_MEM_EFFICIENT, dtype, cap):
             return SDPA_MEM_EFFICIENT
-        _warn_unavailable(requested)
-        return _auto_concrete(cap)
+        _warn_unavailable(requested, f"dtype {dtype}")
+        return _auto_concrete(cap, dtype)
     if requested == SDPA:
-        if cap.torch_flash:
+        if cap.torch_flash and _fused_dtype_supported(SDPA_FLASH, dtype, cap):
             return SDPA_FLASH
-        if cap.torch_mem_efficient:
+        if cap.torch_mem_efficient and _fused_dtype_supported(SDPA_MEM_EFFICIENT, dtype, cap):
             return SDPA_MEM_EFFICIENT
-        return MATH
-    return _auto_concrete(cap)  # AUTO
+        return SDPA_MATH if cap.device == "cuda" else MATH
+    return _auto_concrete(cap, dtype)  # AUTO
 
 
 def set_backend_flags(backend: str = AUTO) -> None:
@@ -607,6 +668,11 @@ def _sdpa(
             kernel = getattr(SDPBackend, "FLASH_ATTENTION", None)
         elif backend == SDPA_MEM_EFFICIENT:
             kernel = getattr(SDPBackend, "EFFICIENT_ATTENTION", None)
+        elif backend == SDPA_MATH:
+            # Pinning MATH suppresses the per-call "fused kernel not used"
+            # warnings that auto-dispatch emits for a dtype the fused kernels
+            # reject (e.g. bf16 on Turing) and guarantees the call succeeds.
+            kernel = getattr(SDPBackend, "MATH", None)
     compiling = getattr(
         getattr(torch, "compiler", None), "is_compiling", lambda: False
     )()
@@ -717,8 +783,15 @@ def causal_attention(
 
     if mask is not None and concrete == FLASH_ATTN:
         # dao-AILab FA2 accepts only causal (no arbitrary mask) — fall back to a
-        # torch SDPA kernel that does, or to the exact math reference.
-        concrete = SDPA_MEM_EFFICIENT if cap.torch_mem_efficient else MATH
+        # torch SDPA kernel that does (and accepts this dtype), or to math.
+        if cap.torch_mem_efficient and _fused_dtype_supported(
+            SDPA_MEM_EFFICIENT, q.dtype, cap
+        ):
+            concrete = SDPA_MEM_EFFICIENT
+        elif cap.device == "cuda":
+            concrete = SDPA_MATH
+        else:
+            concrete = MATH
 
     if concrete == FLASH_ATTN:
         y = _flash_attn_2(
@@ -730,31 +803,44 @@ def causal_attention(
             if out_backend is not None:
                 out_backend.append(FLASH_ATTN)
             return y
-        concrete = _auto_concrete(cap)
+        concrete = _auto_concrete(cap, q.dtype)
         if concrete == FLASH_ATTN:  # package present but call failed — guard
             concrete = MATH
 
     if concrete in (SDPA_FLASH, SDPA_MEM_EFFICIENT, SDPA_MATH):
-        use_gqa = groups > 1 and cap.fused_gqa
-        if use_gqa:
-            y = _sdpa(
-                _maybe_scale_q(q, scale or 1.0 / math.sqrt(head_dim)),
-                k, v,
-                dropout_p=dropout_p, is_causal=effective_causal,
-                backend=concrete, attention_mask=mask,
-            )
+        # GQA is only passed through to the fused kernels natively; the math
+        # kernel always receives explicitly expanded KV heads.
+        use_gqa = (
+            groups > 1 and cap.fused_gqa
+            and concrete in (SDPA_FLASH, SDPA_MEM_EFFICIENT)
+        )
+        try:
+            if use_gqa:
+                y = _sdpa(
+                    _maybe_scale_q(q, scale or 1.0 / math.sqrt(head_dim)),
+                    k, v,
+                    dropout_p=dropout_p, is_causal=effective_causal,
+                    backend=concrete, attention_mask=mask,
+                )
+            else:
+                k2 = _repeat_kv(k, groups)
+                v2 = _repeat_kv(v, groups)
+                y = _sdpa(
+                    _maybe_scale_q(q, scale or 1.0 / math.sqrt(head_dim)),
+                    k2, v2,
+                    dropout_p=dropout_p, is_causal=effective_causal,
+                    backend=concrete, attention_mask=mask,
+                )
+        except RuntimeError as exc:
+            # Last-resort safety net: a kernel that slipped past resolution
+            # rejected the call (e.g. "No available kernel" on a dtype/build
+            # mismatch). Degrade to the exact math reference — never crash.
+            _warn_sdpa_fallback(concrete, exc)
+            concrete = MATH
         else:
-            k2 = _repeat_kv(k, groups)
-            v2 = _repeat_kv(v, groups)
-            y = _sdpa(
-                _maybe_scale_q(q, scale or 1.0 / math.sqrt(head_dim)),
-                k2, v2,
-                dropout_p=dropout_p, is_causal=effective_causal,
-                backend=concrete, attention_mask=mask,
-            )
-        if out_backend is not None:
-            out_backend.append(concrete)
-        return y
+            if out_backend is not None:
+                out_backend.append(concrete)
+            return y
 
     # Math (reference) path.
     k2 = _repeat_kv(k, groups)

@@ -46,6 +46,29 @@ def setup_logging(level: str = "INFO", log_dir: str | None = None) -> logging.Lo
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Mixed-precision dtype selection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_amp_dtype(device: str) -> torch.dtype:
+    """Pick the mixed-precision dtype for ``device``.
+
+    bf16 is used only on Ampere+ (sm80+) CUDA GPUs: torch's fused SDPA kernels
+    (FlashAttention / memory-efficient) support bf16 there, and bf16 tensor
+    cores run at full rate. On Turing and older (sm75 and below) the fused
+    kernels accept only fp16 — bf16 there halves attention throughput and can
+    leave ``scaled_dot_product_attention`` with no kernel to run
+    (``RuntimeError: No available kernel``) — so fp16 is the safe, fast
+    choice. CPU runs fp32.
+    """
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return torch.float32
+    cc = torch.cuda.get_device_capability(0)
+    if cc[0] >= 8 and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Model Presets
 # ──────────────────────────────────────────────────────────────────────────────
 
