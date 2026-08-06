@@ -127,6 +127,13 @@ class TeacherClient:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
+            # Cloudflare in front of a gateway blocks the default
+            # ``Python-urllib`` User-Agent with a 1010 Browser Integrity Check.
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Safari/537.36"
+            ),
         }
         last_err: Exception | None = None
         for attempt in range(self.max_retries + 1):
