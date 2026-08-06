@@ -566,19 +566,17 @@ print(config.summary())
 
 ## Training on Google Colab (free GPU)
 
-No GPU at home? The included **`Metis_Colab_Training.ipynb`** trains the 100M West
-Bengal model on Colab's free T4 GPU and saves every checkpoint straight to your
+No GPU at home? The included **`Metis_Colab_Training.ipynb`** trains Metis from any
+plain-text corpus on Colab's free T4 GPU and saves every checkpoint straight to your
 **Google Drive** (so a Colab disconnect loses nothing).
 
-**8 cells, run top to bottom:**
+**Run top to bottom:**
 1. Mount Google Drive.
-2. Clone this repo (it's public — no login needed).
-3. Install dependencies.
-4. Generate the West Bengal dataset.
-5. Link the checkpoint folder into Drive — checkpoints save there as training runs.
-6. Train on the GPU (`train_westbengal_100m.py`, default 1000 steps).
-7. Confirm the checkpoints are in `MyDrive/Metis/`.
-8. (Optional) Generate a sample from the trained model.
+2. Clone this repo (it's public — no login needed) + install dependencies.
+3. Pick your dataset — drop a `.txt` corpus into Drive (or upload it), or fall back to a
+   corpus shipped with the repo.
+4. Train on the GPU (`metis train`, `tiny` preset, 5000 steps, `cl100k_base` BPE).
+5. Re-run the cell to **resume** — checkpoints land in `MyDrive/Metis/checkpoints_train`.
 
 **Open the notebook — one click:**
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iamasrakib/Metis/blob/main/Metis_Colab_Training.ipynb)
@@ -586,12 +584,7 @@ Bengal model on Colab's free T4 GPU and saves every checkpoint straight to your
 Or: Colab → **File → Open notebook → GitHub** → select `iamasrakib/Metis` →
 `Metis_Colab_Training.ipynb`.
 
-Switch dataset/model? Uncomment another generator in Step 4 and change `CKPT_DIR` /
-`MAX_ITERS` in Steps 5–6 (the notebook lists each training script's matching
-checkpoint dir).
-
-The notebook also includes **Step 13 — Distill from an API**: set your teacher
-credentials, link `checkpoints_distill/` into Drive, and let it train forever.
+Bigger corpus/model? Raise `--iters` or switch `--preset` to `small`/`medium` in Step 4.
 
 ---
 
@@ -622,8 +615,8 @@ metis distill --checkpoint-dir checkpoints_distill --preset tiny --tokenizer cl1
   checkpoint dir.
 - **Resume:** re-run the same command. It reloads `latest_checkpoint.pt`,
   `distill_state.json`, and `tokenizer.json` and continues exactly where it
-  stopped. This works across days, machines, and Colab reconnects (the notebook
-  symlinks the checkpoint dir into Drive).
+  stopped. This works across days and machines (and Colab reconnects if the
+  checkpoint dir lives on Drive).
 - A trained checkpoint dir is a normal Metis checkpoint — chat with it via
   `metis chat --checkpoint-dir checkpoints_distill`.
 
