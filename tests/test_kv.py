@@ -134,6 +134,21 @@ class TestLayerKV:
         with pytest.raises(RuntimeError, match="overflow"):
             layer.append(k, k)  # 3+3 > 4
 
+    def test_overflow_with_sink_headroom(self):
+        """Attention-sink caches hold max_seq_len + 1 tokens (sink + new).
+
+        Regression for the fix where ``_max_len`` did not reserve the extra
+        slot the attention sink needs on a cold start.
+        """
+        cfg = _cfg(kv_backend="static", max_seq_len=4, use_attention_sink=True)
+        layer = LayerKV("static", cfg)
+        k = torch.randn(1, 4, 1, 16)
+        for _ in range(5):  # 4 real + 1 sink headroom must fit
+            layer.append(k, k)
+        assert layer.cached_len == 5
+        with pytest.raises(RuntimeError, match="overflow"):
+            layer.append(k, k)  # 6 > max_seq_len + 1
+
     def test_tuple_compat(self):
         cfg = _cfg(kv_backend="static")
         layer = LayerKV("static", cfg)
@@ -357,6 +372,42 @@ class TestModelMLA:
         l_dec, _, _ = model(idx[:, -1:], kv_cache=cache)
         l_cached = l_dec[:, -1, :]
         assert (l_ref - l_cached).abs().max().item() < 1e-4
+
+    def test_prefill_uses_same_scale_as_decode(self):
+        """Prefill must pass ``scale=self.scale`` to causal_attention.
+
+        Regression for the MLA prefill/decode scale mismatch: the absorbed
+        decode path multiplies scores by ``self.scale``, but prefill used to
+        dispatch with ``scale=None`` (defaulting to ``1/sqrt(head_dim + rope)``
+        via causal_attention) while ``self.scale = 1/sqrt(head_dim)`` under the
+        default ``mla_scale_head_dim=False`` — a ~1.22x mismatch that silently
+        changed sampling sharpness mid-sequence and broke the prefill==decode
+        KV-cache contract. The numeric impact is damped by softmax on a tiny
+        random model, so assert the contract directly by spying on the scale
+        argument the prefill path forwards.
+        """
+        import metis.mla as mla_mod
+        from metis.mla import MLAAttention
+        cfg = _cfg(kv_backend="mla")   # mla_scale_head_dim defaults to False
+        model = _seeded_model(cfg)
+        attn = next(m for m in model.modules() if isinstance(m, MLAAttention))
+
+        captured = {}
+        orig = mla_mod.causal_attention
+
+        def spy(*args, **kwargs):
+            captured["scale"] = kwargs.get("scale")
+            return orig(*args, **kwargs)
+
+        mla_mod.causal_attention = spy
+        try:
+            model(torch.randint(0, 256, (1, 8)))
+        finally:
+            mla_mod.causal_attention = orig
+
+        # With mla_scale_head_dim=False, self.scale (1/sqrt(head_dim)) differs
+        # from causal_attention's None-default (1/sqrt(head_dim + rope)).
+        assert captured["scale"] == attn.scale
 
     def test_deterministic(self):
         cfg = _cfg(kv_backend="mla")

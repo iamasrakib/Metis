@@ -33,7 +33,6 @@ from dataclasses import dataclass, field
 
 import torch
 
-
 # ── Prefetching ───────────────────────────────────────────────────────────────
 
 class ThreadPrefetcher:
@@ -70,7 +69,7 @@ class ThreadPrefetcher:
         self._thread: threading.Thread | None = None
         self._error: BaseException | None = None
 
-    def start(self) -> "ThreadPrefetcher":
+    def start(self) -> ThreadPrefetcher:
         if self._thread is None or not self._thread.is_alive():
             self._stop.clear()
             self._error = None
@@ -99,11 +98,20 @@ class ThreadPrefetcher:
             self._stop.set()
 
     def next_step(self):
-        """Return the next step's ``micro_batches`` batches (blocking)."""
-        if self._error is not None:
-            raise RuntimeError(f"prefetch worker failed: {self._error}") from self._error
-        step = self._queue.get()
-        return step
+        """Return the next step's ``micro_batches`` batches (blocking).
+
+        Polls with a short timeout and re-checks ``self._error`` each cycle so a
+        producer crash that lands *after* the error check (or before the first
+        ``put``) is surfaced instead of leaving the consumer blocked on
+        ``get()`` forever.
+        """
+        while True:
+            if self._error is not None:
+                raise RuntimeError(f"prefetch worker failed: {self._error}") from self._error
+            try:
+                return self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
 
     def stop(self) -> None:
         """Signal the producer to stop and wait for it to wind down.
@@ -120,7 +128,7 @@ class ThreadPrefetcher:
                 pass
             self._thread.join(timeout=5.0)
 
-    def __enter__(self) -> "ThreadPrefetcher":
+    def __enter__(self) -> ThreadPrefetcher:
         return self.start()
 
     def __exit__(self, *exc) -> None:
@@ -259,6 +267,13 @@ class GpuBatchStager:
                 for key, t in tensors.items()
             }
             self._slots[slot] = staged
+        else:
+            # Variable-length batches (a trailing partial batch, a final smaller
+            # packed bin) must regrow the slot buffer, not crash the copy_ with
+            # a size mismatch. Fresh buffers keep the next copy_ non-blocking.
+            for key, t in tensors.items():
+                if key not in staged or staged[key].shape != t.shape:
+                    staged[key] = torch.empty_like(t, device=self._device)
 
         with torch.cuda.stream(self.copy_stream):
             for key, t in tensors.items():
@@ -309,6 +324,38 @@ def _is_cuda_tensor(v) -> bool:
     return isinstance(v, torch.Tensor) and v.is_cuda
 
 
+def _contains_cuda_tensor(obj) -> bool:
+    """True if ``obj`` holds any CUDA tensor, recursing into nested containers.
+
+    Checkpoint dicts from :func:`metis.training.build_checkpoint_raw` store the
+    model/optimizer/EMA state as *nested* dicts, so a shallow top-level scan
+    would miss every CUDA tensor and silently route the write onto the unsafe
+    CPU path (live GPU weights pickled while the optimizer mutates them).
+    """
+    if isinstance(obj, dict):
+        return any(_contains_cuda_tensor(v) for v in obj.values())
+    if isinstance(obj, (tuple, list)):
+        return any(_contains_cuda_tensor(v) for v in obj)
+    return _is_cuda_tensor(obj)
+
+
+def _to_cpu_deep(obj, non_blocking: bool = True):
+    """Recursively clone CUDA tensors to CPU, preserving container structure.
+
+    Non-tensor leaves (ints, floats, strings, plain dicts) pass through
+    untouched so the checkpoint metadata survives the snapshot.
+    """
+    if isinstance(obj, dict):
+        return {k: _to_cpu_deep(v, non_blocking) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu_deep(v, non_blocking) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu_deep(v, non_blocking) for v in obj)
+    if _is_cuda_tensor(obj):
+        return obj.detach().to("cpu", non_blocking=non_blocking)
+    return obj
+
+
 class AsyncCheckpointer:
     """Background-thread ``torch.save`` with a bounded pending queue.
 
@@ -351,18 +398,25 @@ class AsyncCheckpointer:
             except BaseException as e:
                 self._errors.append(e)
 
-    def _async_snapshot(self, checkpoint: dict) -> tuple:
-        """Clone CUDA tensors to CPU on the checkpoint stream; return (dict, event)."""
+    def _async_snapshot(self, checkpoint: dict, compute_done=None) -> tuple:
+        """Clone CUDA tensors to CPU on the checkpoint stream; return (dict, event).
+
+        ``compute_done`` is the CUDA event marking the weights final. When it is
+        ``None`` the copy stream waits on an event recorded on the caller's
+        *current* stream instead, so whatever compute preceded the submit is
+        finalized before the snapshot reads the weights.
+        """
         if self._ckpt_stream is None:
             self._ckpt_stream = torch.cuda.Stream(device="cuda")
         stream = self._ckpt_stream
-        # Wait for the caller's compute (weights final) before reading.
-        stream.wait_event(self._compute_done)
+        if compute_done is not None:
+            stream.wait_event(compute_done)
+        else:
+            current_done = torch.cuda.Event()
+            current_done.record(torch.cuda.current_stream())
+            stream.wait_event(current_done)
         with torch.cuda.stream(stream):
-            cpu_ckpt = {
-                k: v.detach().to("cpu", non_blocking=True) if _is_cuda_tensor(v) else v
-                for k, v in checkpoint.items()
-            }
+            cpu_ckpt = _to_cpu_deep(checkpoint)
             event = torch.cuda.Event()
             event.record(stream)
         return cpu_ckpt, event
@@ -372,17 +426,18 @@ class AsyncCheckpointer:
 
         ``compute_done`` is the CUDA event recorded after the optimizer/EMA
         update that finalises the weights being snapshotted (None → the
-        snapshot waits on the current stream instead). Tensor values that are
-        CUDA tensors are cloned to CPU asynchronously on a dedicated copy
-        stream; the writer thread pickles them once the copy completes.
+        snapshot waits on the current stream instead). CUDA tensors — found
+        anywhere in the checkpoint, including nested ``state_dict`` dicts — are
+        cloned to CPU asynchronously on a dedicated copy stream; the writer
+        thread pickles the CPU clone once the copy completes. Without the
+        snapshot, pickling live GPU weight storage concurrently with
+        ``optimizer.step`` would save a torn checkpoint.
         """
-        if compute_done is not None:
-            self._compute_done = compute_done
-        if not torch.cuda.is_available() or not any(_is_cuda_tensor(v) for v in checkpoint.values()):
+        if not torch.cuda.is_available() or not _contains_cuda_tensor(checkpoint):
             # CPU path: no D2H to overlap — hand the dict straight to the writer.
             self._queue.put((path, checkpoint, None))
             return
-        cpu_ckpt, event = self._async_snapshot(checkpoint)
+        cpu_ckpt, event = self._async_snapshot(checkpoint, compute_done)
         self._pending_d2h = event
         self._queue.put((path, cpu_ckpt, event))
 
@@ -420,11 +475,16 @@ class AsyncCheckpointer:
             ) from self._errors[0]
 
     def close(self) -> None:
-        self.flush()
-        self._queue.put(None)
-        self._thread.join(timeout=5.0)
+        # Always send the sentinel so the writer thread winds down even when
+        # flush() raises (disk-write error) — otherwise the thread spins on
+        # queue.get() forever and a re-close() flushes a stuck writer.
+        try:
+            self.flush()
+        finally:
+            self._queue.put(None)
+            self._thread.join(timeout=5.0)
 
-    def __enter__(self) -> "AsyncCheckpointer":
+    def __enter__(self) -> AsyncCheckpointer:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -524,11 +584,14 @@ class GpuIdleTracker:
         for r in rows:
             for k, v in r.get("stages", {}).items():
                 stages[k] = stages.get(k, 0.0) + v
+        # Clamp at 0 like end() does: event-timing jitter can make aggregate
+        # gpu_ms exceed wall_ms, and a negative "GPU idle" misleads the metric.
+        idle_pct = (1.0 - gpu / wall) * 100 if wall > 0 else 0.0
         return {
             "steps": len(rows),
             "wall_ms": wall,
             "gpu_ms": gpu,
-            "idle_pct": (1.0 - gpu / wall) * 100 if wall > 0 else 0.0,
+            "idle_pct": max(0.0, idle_pct),
             "stages": stages,
         }
 

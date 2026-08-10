@@ -25,21 +25,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install tqdm numpy tiktoken tokenizers
-          pip install pytest ruff
+          pip install -e '.[test]'
 
       - name: Lint with Ruff
         run: |
-          ruff check metis/
+          ruff check metis/ tests/
 
       - name: Run tests
         run: |
           python -m pytest tests/ -v --tb=short -x -W ignore::DeprecationWarning
 
-      - name: Test CLI help
+      - name: Validate notebook
         run: |
-          python -m metis.cli --help
-          python -m metis.cli train --help
-          python -m metis.cli generate --help
-          python -m metis.cli chat --help
-          python -m metis.cli info --help
+          python -c "import json; nb=json.load(open('Metis_Colab_Training.ipynb', encoding='utf-8')); cells=nb['cells']; assert all(isinstance(c['source'], list) and all(isinstance(s, str) for s in c['source']) for c in cells), 'cell sources must be lists of strings'; print(f'notebook OK: {len(cells)} cells')"
+
+      - name: Test CLI entry points
+        run: |
+          metis --help
+          for cmd in train generate chat serve ui info find-lr distill; do
+            metis "$cmd" --help
+          done

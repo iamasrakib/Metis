@@ -13,12 +13,15 @@ Tests cover:
 
 import os
 import sys
+
 import numpy as np
 import pytest
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from metis.config import ModelConfig  # noqa: E402
+from metis.model import MetisLM  # noqa: E402
 from metis.packing import (  # noqa: E402
     BIN,
     STREAM,
@@ -27,12 +30,8 @@ from metis.packing import (  # noqa: E402
     build_attention_mask,
     build_position_ids,
     pack_bins,
-    pack_documents,
     pack_stream,
 )
-from metis.config import ModelConfig  # noqa: E402
-from metis.model import MetisLM  # noqa: E402
-
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -158,13 +157,14 @@ class TestPackBins:
                 assert not m[real:, :real].any() and not m[:real, real:].any()
 
     def test_bin_labels(self, short_docs):
-        _, cu_seqlens, label_chunks, _ = pack_bins(short_docs, 32, EOS, PAD)
-        for cs, lbl in zip(cu_seqlens, label_chunks):
+        bins, cu_seqlens, label_chunks, _ = pack_bins(short_docs, 32, EOS, PAD)
+        for bin_tokens, cs, lbl in zip(bins, cu_seqlens, label_chunks):
             for s in range(len(cs) - 1):
                 start, end = cs[s], cs[s + 1]
-                # labels within segment: shifted by 1, eos position → pad
+                # Next-token shift within a segment: lbl[t] predicts token t+1
+                # (so the last real token of a document predicts <eos>).
                 for t in range(start, end - 1):
-                    assert lbl[t] == lbl[t]  # just verify no crash
+                    assert lbl[t] == bin_tokens[t + 1]
                 assert lbl[end - 1] == PAD  # segment end → ignore
 
 

@@ -455,7 +455,7 @@ def main():
     print(f"   Unique Q&A pairs:   {len(QA_PAIRS):>8,}")
     print(f"   Total exchanges:    {len(QA_PAIRS) * 4:>8,}")
     print(f"\nReady for training!")
-    print(f"  python train_cow.py")
+    print(f"  metis train --dataset data/cow_all.txt")
 
 
 if __name__ == "__main__":

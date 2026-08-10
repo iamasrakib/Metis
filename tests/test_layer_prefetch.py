@@ -77,7 +77,8 @@ class TestCorrectness:
         m_on.load_state_dict(m_off.state_dict())
         assert m_on._layer_prefetch is not None and m_off._layer_prefetch is None
         x, y = _inputs(m_off.config.device)
-        m_off.eval(); m_on.eval()
+        m_off.eval()
+        m_on.eval()
         with torch.no_grad():
             for _ in range(4):  # steps 1+ exercise the prefetch path
                 l_off, loss_off, _ = m_off(x, y)
@@ -93,16 +94,19 @@ class TestCorrectness:
         m_on = _make(True)
         m_on.load_state_dict(m_off.state_dict())
         x, y = _inputs(m_off.config.device)
-        m_off.train(); m_on.train()
+        m_off.train()
+        m_on.train()
         for m in (m_off, m_on):
             for _ in range(2):  # warm: populate records + caches
                 m(x, y)[0].sum().backward()
                 m.zero_grad()
             m.invalidate_moe_caches()
         torch.manual_seed(7)
-        l_off, loss_off, _ = m_off(x, y); l_off.sum().backward()
+        l_off, loss_off, _ = m_off(x, y)
+        l_off.sum().backward()
         torch.manual_seed(7)
-        l_on, loss_on, _ = m_on(x, y); l_on.sum().backward()
+        l_on, loss_on, _ = m_on(x, y)
+        l_on.sum().backward()
         g_off = [p.grad.clone() for p in m_off.parameters() if p.grad is not None]
         g_on = [p.grad.clone() for p in m_on.parameters() if p.grad is not None]
         assert loss_off == loss_on
@@ -116,7 +120,8 @@ class TestCorrectness:
         torch.manual_seed(0)
         m2 = _make(True)
         x, y = _inputs(m1.config.device)
-        m1.eval(); m2.eval()
+        m1.eval()
+        m2.eval()
         with torch.no_grad():
             for _ in range(3):
                 l1, _, _ = m1(x, y)
@@ -129,7 +134,8 @@ class TestCorrectness:
 class TestCachePrefetch:
     def test_prefetch_does_not_touch_counters(self):
         c = ExpertCache(64)
-        w1 = torch.randn(8, 16); w2 = torch.randn(16, 8)
+        w1 = torch.randn(8, 16)
+        w2 = torch.randn(16, 8)
         src = [w1, w2]
         c.prefetch((0,), torch.float32, src,
                    build=lambda: (w1.clone(), w2.clone()))
@@ -138,7 +144,8 @@ class TestCachePrefetch:
 
     def test_prefetched_entry_served_as_hit(self):
         c = ExpertCache(64)
-        w1 = torch.randn(8, 16); w2 = torch.randn(16, 8)
+        w1 = torch.randn(8, 16)
+        w2 = torch.randn(16, 8)
         src = [w1, w2]
         c.prefetch((0,), torch.float32, src,
                    build=lambda: (w1.clone(), w2.clone()))
@@ -151,7 +158,8 @@ class TestCachePrefetch:
     def test_prefetch_rebuilds_on_staleness(self):
         """A weight mutation between prefetch and use forces a rebuild."""
         c = ExpertCache(64)
-        w1 = torch.randn(8, 16); w2 = torch.randn(16, 8)
+        w1 = torch.randn(8, 16)
+        w2 = torch.randn(16, 8)
         src = [w1, w2]
         c.prefetch((0,), torch.float32, src,
                    build=lambda: (w1.clone(), w2.clone()))
@@ -163,14 +171,16 @@ class TestCachePrefetch:
 
     def test_prefetch_noop_when_disabled(self):
         c = ExpertCache(0)  # disabled
-        w1 = torch.randn(8, 16); w2 = torch.randn(16, 8)
+        w1 = torch.randn(8, 16)
+        w2 = torch.randn(16, 8)
         c.prefetch((0,), torch.float32, [w1, w2],
                    build=lambda: (w1, w2))
         assert c.prefetched == 0
 
     def test_reprefetch_noop_when_fresh(self):
         c = ExpertCache(64)
-        w1 = torch.randn(8, 16); w2 = torch.randn(16, 8)
+        w1 = torch.randn(8, 16)
+        w2 = torch.randn(16, 8)
         src = [w1, w2]
         c.prefetch((0,), torch.float32, src, build=lambda: (w1, w2))
         c.prefetch((0,), torch.float32, src, build=lambda: (w1, w2))
@@ -213,13 +223,17 @@ class TestPrefetchFlow:
         m_on = _make(True, cache_size=16)
         m_on.load_state_dict(m_off.state_dict())
         x, y = _inputs(m_off.config.device)
-        m_off.eval(); m_on.eval()
+        m_off.eval()
+        m_on.eval()
         with torch.no_grad():
             for _ in range(4):
-                m_off(x, y); m_on(x, y)  # populate records
+                m_off(x, y)
+                m_on(x, y)  # populate records
             for _ in range(4):  # measured steps, cold each time
-                m_off.invalidate_moe_caches(); m_off(x, y)
-                m_on.invalidate_moe_caches(); m_on(x, y)
+                m_off.invalidate_moe_caches()
+                m_off(x, y)
+                m_on.invalidate_moe_caches()
+                m_on(x, y)
         hr_off = sum(s["hits"] for s in m_off.get_moe_cache_stats() if s)
         hr_on = sum(s["hits"] for s in m_on.get_moe_cache_stats() if s)
         assert hr_on > hr_off  # prefetch converts cold misses into hits

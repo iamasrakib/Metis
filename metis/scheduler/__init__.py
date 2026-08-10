@@ -21,7 +21,7 @@ suite (``benchmarks/verify_exec_plan_parity.py``) proves outputs are
 bit-identical to the eager path.
 """
 
-from .buffers import Arena, BufferAssignment, assign
+from .buffers import BufferAssignment, assign
 from .graph import (
     ADD,
     ATTN,
@@ -33,7 +33,6 @@ from .graph import (
     GEMM,
     HEAD,
     KV_APPEND,
-    LOSS,
     MOE_GEMM,
     MOE_ROUTE,
     NOOP,
@@ -78,10 +77,8 @@ __all__ = [
     "MOE_ROUTE",
     "MOE_GEMM",
     "HEAD",
-    "LOSS",
     "NOOP",
     # buffers
-    "Arena",
     "BufferAssignment",
     "assign",
 ]

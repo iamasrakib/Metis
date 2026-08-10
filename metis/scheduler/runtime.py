@@ -35,6 +35,7 @@ import logging
 import torch
 import torch.nn.functional as F
 
+from ..kv import KVCache, cached_len_of
 from ..model import SwiGLU
 from .planner import INFER, TRAIN, ExecutionPlan, plan_execution
 
@@ -152,16 +153,33 @@ class ExecutionScheduler:
         residual = model.tok_emb(idx)
         self.counters["residual_allocs"] += 1
         if not config.use_rope:
+            # Absolute positions: during warm decode that is cached_len + i,
+            # not a fresh 0..T-1 (see MetisLM.forward — same contract).
+            base = cached_len_of(kv_cache)
             pos = position_ids if position_ids is not None else \
-                torch.arange(0, T, dtype=torch.long, device=device)
+                base + torch.arange(0, T, dtype=torch.long, device=device)
             residual = residual + model.pos_emb(pos)
         residual = model.drop(residual)
+
+        # KV-cache container per backend — mirrors MetisLM.forward. Without
+        # this, the "static"/"quantized" backends were silently bypassed under
+        # the scheduler (every layer got ``None`` and rebuilt legacy tuples).
+        backend = config.kv_backend
+        if backend in ("default", "mla"):
+            container = kv_cache
+        elif kv_cache is None:
+            container = KVCache(backend, config, len(model.layers))
+        elif isinstance(kv_cache, KVCache):
+            container = kv_cache
+        else:
+            container = KVCache.from_legacy(
+                backend, config, kv_cache, len(model.layers))
 
         new_kv_cache = []
         for i, layer in enumerate(model.layers):
             if model._layer_prefetch is not None:
                 model._layer_prefetch.prefetch_next(i)
-            layer_cache = kv_cache[i] if kv_cache is not None else None
+            layer_cache = container[i] if container is not None else None
             ln1_out = layer.ln_1(residual)
             attn_out, new_cache = layer.attn(
                 ln1_out, kv_cache=layer_cache,
@@ -179,12 +197,14 @@ class ExecutionScheduler:
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=0,
+                ignore_index=config.pad_id,
             )
         else:
             logits = model.lm_head(x[:, [-1], :])
             loss = None
-        return logits, loss, new_kv_cache
+        if backend in ("default", "mla"):
+            return logits, loss, new_kv_cache
+        return logits, loss, container
 
     def _ffn(self, layer, x: torch.Tensor) -> torch.Tensor:
         """FFN forward with the SwiGLU activation folded in place.

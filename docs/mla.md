@@ -106,8 +106,9 @@ The public API is unchanged — `MetisLM.forward(..., kv_cache=...) ->
 | `mla_scale_head_dim` | `False` | scale scores by `sqrt(content+rope)` (True) or `sqrt(content)` (False, DeepSeek choice) |
 | `use_rope` | `True` | required — MLA's rope-split key needs RoPE |
 
-Validate: `ModelConfig(kv_backend="mla", n_kv_heads=2)` raises (MLA is MHA-only
-in this implementation).
+Validate: `kv_backend="mla"` raises in `MLAAttention.__init__` unless RoPE is
+enabled and `n_kv_heads` is `0` or `n_heads` (MLA is MHA-only in this
+implementation).
 
 ## 6. Memory ratio
 

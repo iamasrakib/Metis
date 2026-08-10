@@ -74,7 +74,6 @@ def probe_bandwidth(device: str, size_mb: int = 32) -> float:
             torch.cuda.synchronize()
             times.append(s.elapsed_time(e) * 1e-3)
         else:
-            t0 = torch.cuda.Event(True) if False else None
             import time as _t
             t0 = _t.perf_counter()
             torch.add(a, b, out=c)

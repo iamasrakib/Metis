@@ -643,6 +643,7 @@ def _sdpa(
     is_causal: bool,
     backend: str,
     attention_mask: torch.Tensor | None = None,
+    enable_gqa: bool = False,
 ) -> torch.Tensor:
     """Run ``F.scaled_dot_product_attention`` pinned to ``backend``.
 
@@ -654,11 +655,18 @@ def _sdpa(
     ``attention_mask`` (bool, ``(B, 1, T_q, T_k)``) is passed through as
     ``attn_mask``; when present ``is_causal`` is dropped because the mask is
     already block-diagonal causal.
+
+    ``enable_gqa=True`` hands ``F.scaled_dot_product_attention`` unexpanded KV
+    heads (``n_kv_heads < n_heads``) and lets the fused kernels broadcast them
+    natively. Only legal when the resolved kernel actually supports GQA — the
+    caller gates this on ``cap.fused_gqa``.
     """
     SDPBackend, sdpa_kernel = _get_sdpa_api()
     kwargs = dict(
         query=q, key=k, value=v, dropout_p=dropout_p, is_causal=is_causal
     )
+    if enable_gqa:
+        kwargs["enable_gqa"] = True
     if attention_mask is not None:
         kwargs["attn_mask"] = attention_mask
         kwargs["is_causal"] = False
@@ -816,11 +824,16 @@ def causal_attention(
         )
         try:
             if use_gqa:
+                # Unexpanded KV heads + enable_gqa: the fused kernel broadcasts
+                # n_kv_heads → n_heads internally (no _repeat_kv allocation).
+                # Without the flag the kernel would see mismatched head counts
+                # and throw, silently degrading every GQA call to the math path.
                 y = _sdpa(
                     _maybe_scale_q(q, scale or 1.0 / math.sqrt(head_dim)),
                     k, v,
                     dropout_p=dropout_p, is_causal=effective_causal,
                     backend=concrete, attention_mask=mask,
+                    enable_gqa=True,
                 )
             else:
                 k2 = _repeat_kv(k, groups)

@@ -5,11 +5,12 @@
 import io
 import os
 import sys
+
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from metis.cli import BANNER, _configure_stdio
+from metis.cli import BANNER, _build_train_config, _configure_stdio, build_parser
 
 
 def _cp1252_stream() -> io.TextIOWrapper:
@@ -36,3 +37,35 @@ class TestConfigureStdio:
             pass
         dumb = DumbStream()  # no .reconfigure attribute
         _configure_stdio([dumb])  # must not raise
+
+
+class TestTrainConfig:
+    def test_train_optimizer_default(self):
+        parser = build_parser()
+        args = parser.parse_args(["train"])
+        config = _build_train_config(args)
+        assert config.optimizer == "adamw"
+
+    def test_train_optimizer_bnb8bit(self):
+        parser = build_parser()
+        args = parser.parse_args(["train", "--preset", "1b",
+                                  "--optimizer", "bnb8bit"])
+        config = _build_train_config(args)
+        assert config.optimizer == "bnb8bit"
+
+    def test_train_grad_accum_wiring(self):
+        parser = build_parser()
+        args = parser.parse_args(["train", "--grad-accum", "16"])
+        config = _build_train_config(args)
+        assert config.gradient_accumulation_steps == 16
+
+    def test_train_no_cuda_graphs_wiring(self):
+        parser = build_parser()
+        args = parser.parse_args(["train", "--no-cuda-graphs"])
+        config = _build_train_config(args)
+        assert config.use_cuda_graphs is False
+
+    def test_train_optimizer_invalid_choice(self):
+        parser = build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["train", "--optimizer", "bogus"])

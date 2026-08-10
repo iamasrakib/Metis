@@ -2,15 +2,16 @@
 Μῆτις (Metis) — Unit Tests for Configuration System
 """
 
+import json
 import os
 import sys
-import json
 import tempfile
+
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from metis.config import ModelConfig, PRESETS, setup_logging
+from metis.config import PRESETS, ModelConfig, setup_logging
 
 
 class TestModelConfig:
@@ -46,6 +47,16 @@ class TestModelConfig:
         assert config.d_model == 512
         assert config.n_heads == 8
         assert config.n_layers == 8
+
+    def test_from_preset_1b(self):
+        config = ModelConfig.from_preset("1b")
+        assert config.d_model == 2048
+        assert config.n_heads == 16
+        assert config.n_layers == 16
+        assert config.max_seq_len == 1024
+        assert config.micro_batch_size == 8
+        assert config.gradient_accumulation_steps == 16
+        assert config.optimizer == "adamw"  # preset leaves optimizer at default
 
     def test_from_preset_with_overrides(self):
         config = ModelConfig.from_preset("tiny", max_iters=10000, learning_rate=1e-3)
@@ -143,6 +154,7 @@ class TestModelConfig:
         assert "small" in PRESETS
         assert "medium" in PRESETS
         assert "large" in PRESETS
+        assert "1b" in PRESETS
 
     def test_new_fields_defaults(self):
         """Verify all new Phase 1-4 fields have sensible defaults."""
@@ -162,6 +174,39 @@ class TestModelConfig:
     def test_attn_backend_invalid(self):
         with pytest.raises(ValueError):
             ModelConfig(attn_backend="bogus")
+
+    def test_optimizer_valid(self):
+        assert ModelConfig(optimizer="adamw").optimizer == "adamw"
+        assert ModelConfig(optimizer="bnb8bit").optimizer == "bnb8bit"
+
+    def test_optimizer_invalid(self):
+        with pytest.raises(ValueError, match="optimizer"):
+            ModelConfig(optimizer="bogus")
+
+    def test_interval_positive(self):
+        """A 0 interval would crash train() with modulo-by-zero — must be rejected."""
+        for field in ("log_interval", "val_interval", "sample_interval", "save_interval"):
+            with pytest.raises(ValueError, match=field):
+                ModelConfig(**{field: 0})
+
+    def test_validate_rechecks_mutated_fields(self):
+        """CLI overrides bypass __post_init__; validate() must catch the bad value.
+
+        Regression for the --n-kv-heads override that used to crash in the first
+        forward pass instead of failing fast.
+        """
+        config = ModelConfig(n_heads=8, n_kv_heads=4)  # valid GQA
+        config.n_kv_heads = 5  # 8 % 5 != 0 — invalid, assigned directly
+        with pytest.raises(ValueError, match="n_kv_heads"):
+            config.validate()
+
+    def test_validate_refreshes_derived_values(self):
+        """Re-running validate() recomputes effective_batch_size after overrides."""
+        config = ModelConfig(micro_batch_size=4, gradient_accumulation_steps=8)
+        assert config.effective_batch_size == 32
+        config.micro_batch_size = 16  # post-construction override
+        config.validate()
+        assert config.effective_batch_size == 128
 
 
 class TestSetupLogging:

@@ -122,7 +122,7 @@ Markdown under `benchmarks/results/`). Re-run the parity suite with
 ## Usage
 
 ```bash
-metis train --dataset data/cat_all.txt --preset tiny     # graphs auto-enabled on CUDA
+metis train --dataset data/sample.txt --preset tiny       # graphs auto-enabled on CUDA
 metis train ... --no-cuda-graphs                          # opt out
 ```
 

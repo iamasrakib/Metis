@@ -13,19 +13,16 @@ Professional data pipeline with:
 import hashlib
 import json
 import logging
-import math
 import os
 import pickle
 import re
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterator, List, Optional, Tuple, Union
+from collections.abc import Iterator
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, IterableDataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-from .packing import PackedDataset, STREAM
+from .packing import STREAM, PackedDataset
 
 logger = logging.getLogger("metis.data")
 
@@ -39,23 +36,25 @@ class BPETokenizer:
     and full compatibility with the original CharTokenizer API.
 
     Special tokens:
-        <pad> (0) — Padding token
-        <unk> (1) — Unknown / fallback
-        <bos> (2) — Beginning of sequence
-        <eos> (3) — End of sequence
+        <pad> — Padding token
+        <unk> — Unknown / fallback
+        <bos> — Beginning of sequence
+        <eos> — End of sequence
+
+    In character mode (and the plain :class:`CharTokenizer`) the special ids
+    are the fixed 0..3. In BPE mode they are allocated **above** the native
+    vocabulary by :meth:`_build_tiktoken_encoding` — tiktoken's lowest ids are
+    real tokens (``'!'`` is 0 in cl100k_base), so ``<pad>`` etc. must never
+    share an id with a natural-language token.
 
     Uses OpenAI's tiktoken for fast BPE encoding. Falls back to a
     character-level tokenizer if tiktoken is unavailable or if the
     user explicitly requests character mode.
     """
 
+    # Char-mode baseline. ``_build_tiktoken_encoding`` remaps these to ids
+    # above the native vocab when a real tiktoken encoding is loaded.
     SPECIAL_TOKENS = {"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3}
-    _SPECIAL_REGISTRY = {
-        "<|endoftext|>": "<eos>",
-        "<|startoftext|>": "<bos>",
-        "<|pad|>": "<pad>",
-        "<|unk|>": "<unk>",
-    }
 
     def __init__(self, encoding_name: str = "cl100k_base"):
         """Initialize tokenizer.
@@ -77,22 +76,12 @@ class BPETokenizer:
         # Try loading tiktoken
         if not self._is_char_mode:
             try:
-                import tiktoken
-                self._tiktoken_encoding = tiktoken.get_encoding(encoding_name)
-
-                # Register special tokens with tiktoken
-                special_map = {f"<|{name}|>": id for name, id in
-                               [("pad", 0), ("unk", 1), ("bos", 2), ("eos", 3)]}
-                self._tiktoken_encoding = tiktoken.Encoding(
-                    name=encoding_name,
-                    pat_str=self._tiktoken_encoding._pat_str,
-                    mergeable_ranks=self._tiktoken_encoding._mergeable_ranks,
-                    special_tokens={**self._tiktoken_encoding._special_tokens, **special_map},
-                )
-                self.vocab_size = self._tiktoken_encoding.n_vocab
+                import tiktoken  # noqa: F401  (presence check)
+                self._build_tiktoken_encoding(encoding_name)
                 logger.info(
                     f"BPE tokenizer initialized: {encoding_name} "
-                    f"(vocab_size={self.vocab_size})"
+                    f"(vocab_size={self.vocab_size}, "
+                    f"special_ids={self._special_tokens})"
                 )
             except (ImportError, AttributeError) as e:
                 logger.warning(f"tiktoken not available ({e}), falling back to character tokenizer")
@@ -101,7 +90,10 @@ class BPETokenizer:
 
         if self._is_char_mode:
             self.vocab_size = len(self.SPECIAL_TOKENS)
-            logger.info(f"Character-level tokenizer initialized (vocab_size will be updated at fit())")
+            logger.info(
+                "Character-level tokenizer initialized "
+                "(vocab_size will be updated at fit())"
+            )
 
     @property
     def is_bpe(self) -> bool:
@@ -129,7 +121,7 @@ class BPETokenizer:
         text: str,
         add_bos: bool = False,
         add_eos: bool = False,
-    ) -> List[int]:
+    ) -> list[int]:
         """Encode a string into token IDs.
 
         Args:
@@ -143,7 +135,13 @@ class BPETokenizer:
         if self._is_char_mode and self._char_encoder is not None:
             ids = self._char_encoder.encode(text, add_bos=False, add_eos=False)
         elif self._tiktoken_encoding is not None:
-            ids = self._tiktoken_encoding.encode(text)
+            # ``disallowed_special=()``: special-token strings (<|eos|>, …)
+            # appearing in arbitrary training text are treated as ordinary
+            # tokens instead of raising. Specials are inserted programmatically
+            # via add_bos/add_eos, never by string matching.
+            ids = self._tiktoken_encoding.encode(
+                text, allowed_special=set(), disallowed_special=()
+            )
         else:
             # Pure fallback: ordinal encoding
             ids = [ord(c) + len(self.SPECIAL_TOKENS) for c in text]
@@ -154,7 +152,7 @@ class BPETokenizer:
             ids = ids + [self._special_tokens["<eos>"]]
         return ids
 
-    def decode(self, ids: List[int], skip_special: bool = True) -> str:
+    def decode(self, ids: list[int], skip_special: bool = True) -> str:
         """Decode token IDs back to a string.
 
         Args:
@@ -180,20 +178,26 @@ class BPETokenizer:
                 pass
 
         # Pure fallback: ordinal decode
-        return "".join(chr(i - len(self.SPECIAL_TOKENS)) if i >= len(self.SPECIAL_TOKENS) else "" for i in ids)
+        return "".join(
+            chr(i - len(self.SPECIAL_TOKENS)) if i >= len(self.SPECIAL_TOKENS) else ""
+            for i in ids
+        )
 
-    def encode_batch(self, texts: List[str]) -> List[List[int]]:
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
         """Encode multiple texts efficiently (batched BPE)."""
         if self._is_char_mode or self._tiktoken_encoding is None:
             return [self.encode(t) for t in texts]
 
-        # Use tiktoken's batched encode
+        # Use tiktoken's batched encode (special literals → ordinary tokens,
+        # matching :meth:`encode`).
         results = []
         for text in texts:
-            results.append(self._tiktoken_encoding.encode(text))
+            results.append(self._tiktoken_encoding.encode(
+                text, allowed_special=set(), disallowed_special=()
+            ))
         return results
 
-    def decode_batch(self, batch: List[List[int]]) -> List[str]:
+    def decode_batch(self, batch: list[list[int]]) -> list[str]:
         """Decode multiple ID lists efficiently."""
         if self._is_char_mode or self._tiktoken_encoding is None:
             return [self.decode(ids) for ids in batch]
@@ -208,7 +212,9 @@ class BPETokenizer:
         if self._is_char_mode and self._char_encoder is not None:
             return len(self._char_encoder.encode(text))
         elif self._tiktoken_encoding is not None:
-            return len(self._tiktoken_encoding.encode(text))
+            return len(self._tiktoken_encoding.encode(
+                text, allowed_special=set(), disallowed_special=()
+            ))
         return len(text)
 
     def save(self, path: str) -> None:
@@ -237,7 +243,7 @@ class BPETokenizer:
         Returns:
             self (for chaining).
         """
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
 
         tokenizer_type = data.get("type", "char")
@@ -247,7 +253,10 @@ class BPETokenizer:
             self.encoding_name = data["encoding_name"]
             self._is_char_mode = False
             self._load_tiktoken(self.encoding_name)
-            self.vocab_size = data["vocab_size"]
+            # Special ids derive deterministically from the encoding, so the
+            # vocab size is recomputed rather than trusting a possibly-stale
+            # value saved by a pre-fix checkpoint.
+            self.vocab_size = max(self._special_tokens.values()) + 1
         elif tokenizer_type == "char" and version == "3.0":
             # BPETokenizer saved in char mode
             self._is_char_mode = True
@@ -277,19 +286,58 @@ class BPETokenizer:
         return self
 
     def _load_tiktoken(self, encoding_name: str) -> None:
-        """Load tiktoken encoding by name."""
-        import tiktoken
+        """Load tiktoken encoding by name (registers Metis special tokens)."""
         if encoding_name == "char":
             self._is_char_mode = True
             self._char_encoder = CharTokenizer()
             return
         try:
-            self._tiktoken_encoding = tiktoken.get_encoding(encoding_name)
+            self._build_tiktoken_encoding(encoding_name)
         except Exception:
             logger.warning(f"Failed to load tiktoken '{encoding_name}', trying cl100k_base")
-            self._tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
+            self._build_tiktoken_encoding("cl100k_base")
             self.encoding_name = "cl100k_base"
-        self.vocab_size = self._tiktoken_encoding.n_vocab
+
+    def _build_tiktoken_encoding(self, encoding_name: str) -> None:
+        """Load ``encoding_name`` with Metis special tokens ABOVE its native
+        vocabulary, and update ``self._special_tokens`` / ``vocab_size``.
+
+        tiktoken's mergeable ranks cover the whole native vocab (ids 0..N-1),
+        so its lowest ids are *real* tokens — in cl100k_base id 0 is ``'!'``,
+        id 1 is ``'"'``. Registering ``<pad>`` & co. at ids 0-3 (the original
+        code) made ``<pad>`` and ``'!'`` the same id, corrupting decode,
+        padding, and the bos/eos markers. Every special token is therefore
+        placed at ids strictly above the highest id already in use (including
+        any specials the base encoding owns, e.g. ``<|endoftext|>``).
+
+        Called identically from ``__init__`` and ``_load_tiktoken`` so a fresh
+        tokenizer and a checkpoint-loaded one always agree on the ids.
+        """
+        import tiktoken
+
+        base = tiktoken.get_encoding(encoding_name)
+        high = max(base._mergeable_ranks.values(), default=-1)
+        if base._special_tokens:
+            high = max(high, max(base._special_tokens.values()))
+        first = high + 1
+        special_map = {
+            f"<|{name}|>": first + i
+            for i, name in enumerate(("pad", "unk", "bos", "eos"))
+        }
+        self._tiktoken_encoding = tiktoken.Encoding(
+            name=encoding_name,
+            pat_str=base._pat_str,
+            mergeable_ranks=base._mergeable_ranks,
+            special_tokens={**base._special_tokens, **special_map},
+        )
+        self._special_tokens = {
+            "<pad>": special_map["<|pad|>"],
+            "<unk>": special_map["<|unk|>"],
+            "<bos>": special_map["<|bos|>"],
+            "<eos>": special_map["<|eos|>"],
+        }
+        # Cover the highest special id; native ids are all below ``first``.
+        self.vocab_size = max(special_map.values()) + 1
 
     # ── Properties (compatible with CharTokenizer) ──────────────────────
 
@@ -313,7 +361,10 @@ class BPETokenizer:
         return self.vocab_size
 
     def __repr__(self) -> str:
-        return f"BPETokenizer(type={'bpe' if self.is_bpe else 'char'}, vocab_size={self.vocab_size})"
+        return (
+            f"BPETokenizer(type={'bpe' if self.is_bpe else 'char'}, "
+            f"vocab_size={self.vocab_size})"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -375,7 +426,7 @@ class CharTokenizer:
 
     def load(self, path: str) -> "CharTokenizer":
         if path.endswith(".json"):
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             self.stoi = data["stoi"]
             self.itos = {int(k): v for k, v in data["itos"].items()}
@@ -468,7 +519,7 @@ class MMapDataset(Dataset):
     def __len__(self) -> int:
         return self._len
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         x = torch.from_numpy(self._data[idx: idx + self.seq_len].astype(np.int64))
         y = torch.from_numpy(self._data[idx + 1: idx + self.seq_len + 1].astype(np.int64))
         return x, y
@@ -498,7 +549,7 @@ class TextDataset(Dataset):
     def __len__(self) -> int:
         return len(self.data) - self.seq_len
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.data[idx: idx + self.seq_len]
         y = self.data[idx + 1: idx + self.seq_len + 1]
         return x, y
@@ -513,7 +564,7 @@ class StreamingTextDataset(IterableDataset):
 
     def __init__(
         self,
-        file_paths: List[str],
+        file_paths: list[str],
         tokenizer: BPETokenizer,
         seq_len: int,
         chunk_size: int = 100_000,
@@ -530,18 +581,27 @@ class StreamingTextDataset(IterableDataset):
         self.seq_len = seq_len
         self.chunk_size = chunk_size
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        import itertools
-
-        buffer = []
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        buffer: list[int] = []
+        pending = ""   # char tail carried across chunk boundaries
         for file_path in self.file_paths:
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(file_path, encoding="utf-8") as f:
                 while True:
                     chunk = f.read(self.chunk_size)
                     if not chunk:
                         break
-                    tokens = self.tokenizer.encode(chunk)
-                    buffer.extend(tokens)
+                    text = pending + chunk
+                    # Cut at the last whitespace so a BPE token never spans a
+                    # chunk boundary (a mid-token split changes the tokenization
+                    # vs. a monolithic encode). The tail after the cut is
+                    # carried into the next chunk. Chunks with no whitespace are
+                    # tokenized whole — pathological, never hit for prose.
+                    cut = max(text.rfind(" "), text.rfind("\n"), text.rfind("\t"))
+                    if cut < 0:
+                        body, pending = text, ""
+                    else:
+                        body, pending = text[:cut + 1], text[cut + 1:]
+                    buffer.extend(self.tokenizer.encode(body))
 
                     # Yield complete sequences from buffer
                     while len(buffer) >= self.seq_len + 1:
@@ -549,15 +609,57 @@ class StreamingTextDataset(IterableDataset):
                         y = torch.tensor(buffer[1:self.seq_len + 1], dtype=torch.long)
                         buffer = buffer[self.seq_len:]
                         yield x, y
+            # Flush the carried tail at end-of-file (tokenized whole).
+            if pending:
+                buffer.extend(self.tokenizer.encode(pending))
+                pending = ""
+                while len(buffer) >= self.seq_len + 1:
+                    x = torch.tensor(buffer[:self.seq_len], dtype=torch.long)
+                    y = torch.tensor(buffer[1:self.seq_len + 1], dtype=torch.long)
+                    buffer = buffer[self.seq_len:]
+                    yield x, y
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Tokenization Cache
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _cache_path(dataset_path: str, tokenizer_name: str, seq_len: int) -> str:
-    """Generate a deterministic cache file path for a tokenized dataset."""
-    raw_hash = hashlib.sha256(f"{dataset_path}:{tokenizer_name}".encode()).hexdigest()[:12]
+def _content_fingerprint(text: str) -> str:
+    """Cheap content fingerprint for cache invalidation.
+
+    Hashes the length plus the head/tail of the corpus. Editing a data file
+    always changes one of these, so a stale cache is never silently reused —
+    while a multi-GB corpus is never read into a full hash.
+    """
+    h = hashlib.sha256()
+    h.update(str(len(text)).encode("utf-8"))
+    h.update(text[:65_536].encode("utf-8", "replace"))
+    h.update(text[-65_536:].encode("utf-8", "replace"))
+    return h.hexdigest()[:12]
+
+
+def _tokenizer_cache_name(tokenizer) -> str:
+    """Cache-name for a tokenizer: tiktoken encoding name, or ``"char"``.
+
+    ``is_bpe`` / ``encoding_name`` only exist on :class:`BPETokenizer`, so the
+    access is guarded — the plain :class:`CharTokenizer` (no such attributes)
+    must map to the same ``"char"`` tag the caller uses elsewhere.
+    """
+    return tokenizer.encoding_name if getattr(tokenizer, "is_bpe", False) else "char"
+
+
+def _cache_path(dataset_path: str, tokenizer_name: str, seq_len: int,
+                content_hash: str) -> str:
+    """Generate a deterministic cache file path for a tokenized dataset.
+
+    The key covers the path, tokenizer, sequence length AND the corpus content
+    fingerprint — the original key (path + tokenizer only) silently reused the
+    stale cache whenever a file changed, and made a train split and its val
+    split (same path, different text) collide on one cache file.
+    """
+    raw_hash = hashlib.sha256(
+        f"{dataset_path}:{tokenizer_name}:{content_hash}".encode()
+    ).hexdigest()[:12]
     base = os.path.splitext(os.path.basename(dataset_path))[0]
     cache_dir = os.path.join("cache", "tokenized")
     os.makedirs(cache_dir, exist_ok=True)
@@ -570,7 +672,7 @@ def tokenize_and_cache(
     seq_len: int,
     dataset_path: str,
     force_rebuild: bool = False,
-) -> Tuple[np.ndarray, str]:
+) -> tuple[np.ndarray, str]:
     """Tokenize text and cache the result as a memory-mapped numpy array.
 
     If a valid cache exists, loads from cache instead of re-tokenizing.
@@ -578,8 +680,9 @@ def tokenize_and_cache(
     Returns:
         Tuple of (token_ids_array, cache_path).
     """
-    tokenizer_name = tokenizer.encoding_name if tokenizer.is_bpe else "char"
-    cache_path = _cache_path(dataset_path, tokenizer_name, seq_len)
+    tokenizer_name = _tokenizer_cache_name(tokenizer)
+    cache_path = _cache_path(dataset_path, tokenizer_name, seq_len,
+                             _content_fingerprint(text))
 
     if not force_rebuild and os.path.exists(cache_path):
         logger.info(f"Loading tokenized cache: {cache_path}")
@@ -596,7 +699,10 @@ def tokenize_and_cache(
         dtype = np.uint16
     data = np.array(ids, dtype=dtype)
     np.save(cache_path, data)
-    logger.info(f"Tokenized cache saved: {cache_path} ({len(data):,} tokens, dtype={dtype.__name__})")
+    logger.info(
+        f"Tokenized cache saved: {cache_path} "
+        f"({len(data):,} tokens, dtype={dtype.__name__})"
+    )
     return data, cache_path
 
 
@@ -623,7 +729,7 @@ def load_text(path: str) -> str:
         texts = []
         for fname in txt_files:
             fpath = os.path.join(path, fname)
-            with open(fpath, "r", encoding="utf-8") as f:
+            with open(fpath, encoding="utf-8") as f:
                 text = f.read()
             texts.append(text)
             logger.info(f"Loaded file: {fname} ({len(text):,} chars)")
@@ -636,7 +742,7 @@ def load_text(path: str) -> str:
 
     if not os.path.exists(path):
         raise FileNotFoundError(f"Dataset not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         text = f.read()
     if len(text) < 100:
         logger.warning(f"Dataset is very small ({len(text)} chars). Model may not learn well.")
@@ -647,7 +753,7 @@ def load_text(path: str) -> str:
 def train_val_split(
     text: str,
     train_ratio: float = 0.9,
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
     """Split text into training and validation sets.
 
     Args:
@@ -668,7 +774,7 @@ def train_val_split(
     return train_text, val_text
 
 
-def split_text_into_documents(text: str, min_len: int = 1) -> List[str]:
+def split_text_into_documents(text: str, min_len: int = 1) -> list[str]:
     """Split raw text into documents on paragraph (blank-line) boundaries.
 
     Paragraphs are the natural unit of a corpus that is a plain concatenation
@@ -688,7 +794,7 @@ def split_text_into_documents(text: str, min_len: int = 1) -> List[str]:
     return docs or [text]
 
 
-def load_documents(path: str) -> List[str]:
+def load_documents(path: str) -> list[str]:
     """Load a corpus as a list of documents.
 
     Directory paths yield one document per ``.txt`` file (each file is a
@@ -706,14 +812,14 @@ def load_documents(path: str) -> List[str]:
         docs = []
         for fname in txt_files:
             fpath = os.path.join(path, fname)
-            with open(fpath, "r", encoding="utf-8") as f:
+            with open(fpath, encoding="utf-8") as f:
                 docs.append(f.read())
             logger.info(f"Loaded document: {fname} ({len(docs[-1]):,} chars)")
         return docs
 
     if not os.path.exists(path):
         raise FileNotFoundError(f"Dataset not found: {path}")
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         text = f.read()
     docs = split_text_into_documents(text)
     logger.info(
@@ -724,10 +830,23 @@ def load_documents(path: str) -> List[str]:
 
 
 def split_documents(
-    documents: List[str], train_ratio: float = 0.9
-) -> Tuple[List[str], List[str]]:
-    """Split a document list into train and validation sets (by count)."""
-    n_train = max(1, int(len(documents) * train_ratio))
+    documents: list[str], train_ratio: float = 0.9
+) -> tuple[list[str], list[str]]:
+    """Split a document list into train and validation sets (by count).
+
+    ``n_train`` is clamped so the validation set never comes back empty when
+    there are ≥ 2 documents (the old ``max(1, int(n * ratio))`` produced an
+    empty val for every 1- and 2-document corpus, breaking the validation-loss
+    stage). With a single document the val set is empty and a warning is logged
+    so callers can decide whether that is acceptable.
+    """
+    n_total = len(documents)
+    if n_total < 2:
+        logger.warning(
+            "split_documents: fewer than 2 documents — validation set is empty."
+        )
+        return list(documents), []
+    n_train = max(1, min(n_total - 1, int(n_total * train_ratio)))
     train_docs = documents[:n_train]
     val_docs = documents[n_train:]
     logger.info(
@@ -738,13 +857,13 @@ def split_documents(
 
 
 def create_packed_dataloader(
-    text_or_documents: Union[str, List[str]],
-    tokenizer: Union[BPETokenizer, CharTokenizer],
+    text_or_documents: str | list[str],
+    tokenizer: BPETokenizer | CharTokenizer,
     seq_len: int,
     batch_size: int,
     strategy: str = STREAM,
     shuffle: bool = True,
-    seed: Optional[int] = None,
+    seed: int | None = None,
 ) -> DataLoader:
     """Create a DataLoader that yields dynamically packed batches.
 
@@ -787,9 +906,37 @@ def create_packed_dataloader(
         shuffle=shuffle,
         seed=seed,
     )
-    # pin_memory: staged in page-locked host memory so the overlapped
-    # pipeline's non-blocking H2D copies stay truly asynchronous.
-    return DataLoader(dataset, batch_size=None, num_workers=0, pin_memory=True)
+    # ``pin_memory=True`` is intentionally omitted: with ``batch_size=None``
+    # DataLoader returns the PackedBatch dataclass unchanged and never touches
+    # its inner tensors, so pinning would be a silent no-op. The overlapped
+    # pipeline pins each batch explicitly on the staging thread instead.
+    return DataLoader(dataset, batch_size=None, num_workers=0, pin_memory=False)
+
+
+def _make_loader(dataset, batch_size: int, shuffle: bool, drop_last: bool,
+                 num_workers: int, rank: int = 0, world_size: int = 1) -> DataLoader:
+    """Build a DataLoader over an indexable ``dataset``, sharded per DDP rank.
+
+    With ``world_size > 1`` a :class:`DistributedSampler` gives each rank a
+    disjoint slice of the corpus, so the effective global batch is
+    ``batch_size * world_size`` of *unique* data (without it every rank would
+    iterate the same full corpus and the extra GPUs would train on duplicated
+    examples). ``rank`` must be passed by each DDP process.
+    """
+    if world_size > 1:
+        from torch.utils.data.distributed import DistributedSampler
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank,
+            shuffle=shuffle, drop_last=drop_last,
+        )
+        return DataLoader(
+            dataset, batch_size=batch_size, sampler=sampler,
+            drop_last=drop_last, pin_memory=True, num_workers=num_workers,
+        )
+    return DataLoader(
+        dataset, batch_size=batch_size, shuffle=shuffle,
+        drop_last=drop_last, pin_memory=True, num_workers=num_workers,
+    )
 
 
 def create_dataloader(
@@ -802,6 +949,8 @@ def create_dataloader(
     num_workers: int = 0,
     dataset_path: str = "",
     force_recache: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
     """Create a DataLoader from raw text with caching support.
 
@@ -816,12 +965,20 @@ def create_dataloader(
         dataset_path: Original dataset path (for cache key). If empty,
                       caching is disabled.
         force_recache: Force re-tokenization even if cache exists.
+        rank: DDP rank (0 in single-process training) for data sharding.
+        world_size: Number of DDP processes (1 = no sharding).
 
     Returns:
         PyTorch DataLoader yielding (input, target) batches.
     """
     # Try loading from cache first
     if dataset_path and use_mmap:
+        cache_path = _cache_path(
+            dataset_path,
+            _tokenizer_cache_name(tokenizer),
+            seq_len,
+            _content_fingerprint(text),
+        )
         try:
             data_array, _ = tokenize_and_cache(
                 text, tokenizer, seq_len,
@@ -829,28 +986,32 @@ def create_dataloader(
                 force_rebuild=force_recache,
             )
             dataset = MMapDataset(data_array, seq_len)
-            return DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                drop_last=True,
-                pin_memory=True,
-                num_workers=num_workers,
+        except (OSError, ValueError, EOFError) as e:
+            # Unusable cache (corrupt .npy, wrong dtype, mmap failure) is the
+            # one recoverable condition: drop the bad cache file so the next
+            # run rebuilds it fresh, and fall back to in-memory tokenization.
+            # Anything outside these types is a real bug (e.g. in encode) and
+            # must surface instead of being masked by a silent fallback.
+            logger.warning(f"MMap dataset failed ({e}); falling back to in-memory")
+            try:
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)
+                    logger.info(f"Removed unusable cache: {cache_path}")
+            except OSError:
+                pass
+        else:
+            return _make_loader(
+                dataset, batch_size, shuffle, drop_last=True,
+                num_workers=num_workers, rank=rank, world_size=world_size,
             )
-        except Exception as e:
-            logger.warning(f"MMap dataset failed ({e}), falling back to in-memory")
 
     # Fallback: in-memory dataset
     encoded = tokenizer.encode(text)
     data_tensor = torch.tensor(encoded, dtype=torch.long)
     dataset = TextDataset(data_tensor, seq_len)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=True,
-        pin_memory=True,
-        num_workers=num_workers,
+    return _make_loader(
+        dataset, batch_size, shuffle, drop_last=True,
+        num_workers=num_workers, rank=rank, world_size=world_size,
     )
 
 

@@ -243,7 +243,8 @@ class TestModelParity:
         mp = self._model(PER_EXPERT)
         mp.load_state_dict(mg.state_dict())
         idx = torch.randint(0, 256, (2, 16), device=DEVICE)
-        mg.eval(); mp.eval()
+        mg.eval()
+        mp.eval()
         with torch.no_grad():
             lg, loss_g, _ = mg(idx, targets=idx)
             lp, loss_p, _ = mp(idx, targets=idx)
@@ -258,12 +259,15 @@ class TestModelParity:
         mp = self._model(PER_EXPERT)
         mp.load_state_dict(mg.state_dict())
         idx = torch.randint(0, 256, (2, 16), device=DEVICE)
-        mg.train(); mp.train()
-        _, lg, _ = mg(idx, targets=idx); lg.backward()
+        mg.train()
+        mp.train()
+        _, lg, _ = mg(idx, targets=idx)
+        lg.backward()
         g = {n: p.grad.clone() for n, p in mg.named_parameters()
              if p.grad is not None}
         mp.zero_grad()
-        _, lp, _ = mp(idx, targets=idx); lp.backward()
+        _, lp, _ = mp(idx, targets=idx)
+        lp.backward()
         p = {n: p.grad.clone() for n, p in mp.named_parameters()
              if p.grad is not None}
         assert set(g) == set(p)
@@ -333,9 +337,11 @@ class TestEdgeCases:
         moe_p = MoE(cfg).to(DEVICE)
         moe_p.load_state_dict(moe_g.state_dict())
         x = torch.randn(5, 7, 64, device=DEVICE)
-        moe_g.eval(); moe_p.eval()
+        moe_g.eval()
+        moe_p.eval()
         with torch.no_grad():
-            g = moe_g(x).float(); p = moe_p(x).float()
+            g = moe_g(x).float()
+            p = moe_p(x).float()
         assert torch.allclose(g, p, atol=1e-4, rtol=1e-4), \
             f"max err {(g-p).abs().max().item():.3e}"
 
@@ -364,9 +370,11 @@ class TestEdgeCases:
         moe_p = MoE(cfg).to(DEVICE)
         moe_p.load_state_dict(moe_g.state_dict())
         x = torch.randn(2, 8, 68, device=DEVICE)
-        moe_g.eval(); moe_p.eval()
+        moe_g.eval()
+        moe_p.eval()
         with torch.no_grad():
-            g = moe_g(x).float(); p = moe_p(x).float()
+            g = moe_g(x).float()
+            p = moe_p(x).float()
         assert torch.allclose(g, p, atol=1e-4, rtol=1e-4), \
             f"max err {(g-p).abs().max().item():.3e}"
 

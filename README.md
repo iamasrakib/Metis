@@ -33,7 +33,7 @@
 | **Data** | **Memory-mapped datasets** for GB-scale corpora, streaming iterable dataset, tokenization cache, **dynamic sequence packing** (zero-padding 1D / whole-doc bin) |
 | **Memory** | Gradient checkpointing, weight tying, GQA, optional **Flash Attention v2**, **persistent expert cache** (MoE weights stay resident) |
 | **Scheduling** | **Graph-based execution scheduler** — computation-graph analysis, operator cost model, safe reorder, liveness-based buffer reuse, zero-sync infer path (see `docs/exec_scheduler.md`) |
-| **Usability** | Unified `metis` CLI with 7 commands, interactive chat, structured logging, **test suite** |
+| **Usability** | Unified `metis` CLI with 8 commands, interactive chat, structured logging, **test suite** |
 | **Package** | Clean `from metis import ...` API, pip-installable, CI pipeline
 
 ---
@@ -322,7 +322,7 @@ Verification and benchmarks:
   default; quantized error bounded; MLA absorbed-vs-explicit `5.8e-6`.
 - `benchmarks/benchmark_kv.py` — memory + throughput comparison across all
   backends, writes `benchmarks/results/`.
-- `tests/test_kv.py` — 42 unit tests (quantization round-trip, LayerKV/KVCache
+- `tests/test_kv.py` — 44 unit tests (quantization round-trip, LayerKV/KVCache
   lifecycle, cached_len_of, memory formulas, config validation, model parity).
 
 Full design and measured results:
@@ -368,6 +368,7 @@ train(config, resume=False)
 | `small` | 256 | 4 | 4 | 256 | ~4M | ~1 GB |
 | `medium` | 384 | 6 | 6 | 512 | ~15M | ~3 GB |
 | `large` | 512 | 8 | 8 | 512 | ~35M | ~6 GB |
+| `1b` | 2048 | 16 | 16 | 1024 | ~1.01B | 16 GB (use `--optimizer bnb8bit`) |
 
 ### CLI Commands
 
@@ -387,11 +388,15 @@ metis train [OPTIONS]
 
 Advanced options:
   --dataset PATH        Path to training text file (default: data/input.txt)
-  --preset NAME         Model preset: tiny / small / medium / large
+  --preset NAME         Model preset: tiny / small / medium / large / 1b
   --iters N             Max training iterations (default: 5000)
   --lr FLOAT            Peak learning rate (default: 3e-4)
   --batch-size N        Micro batch size (default: 8)
+  --grad-accum N        Gradient accumulation steps (effective batch = batch-size × grad-accum)
   --seq-len N           Max sequence length (default: 256)
+  --optimizer NAME      Optimizer: adamw (default) / bnb8bit (bitsandbytes 8-bit Adam —
+                        fits ~1B-param models in 16 GB VRAM; falls back to AdamW if
+                        bitsandbytes isn't installed)
   --tokenizer NAME      Tokenizer: char / cl100k_base / p50k_base / o200k_base
   --resume              Resume from latest checkpoint
   --compile             Use torch.compile (PyTorch 2.0+)
@@ -566,17 +571,22 @@ print(config.summary())
 
 ## Training on Google Colab (free GPU)
 
-No GPU at home? The included **`Metis_Colab_Training.ipynb`** trains Metis from any
-plain-text corpus on Colab's free T4 GPU and saves every checkpoint straight to your
-**Google Drive** (so a Colab disconnect loses nothing).
+No GPU at home? The included **`Metis_Colab_Training.ipynb`** trains Metis on Colab's
+free T4 GPU and saves checkpoints straight to your **Google Drive** (a Colab disconnect
+loses nothing). It downloads a **real high-quality corpus — FineWeb-Edu** (HuggingFace's
+educational web corpus, ~500M tokens) and trains the **`1b` preset** with **8-bit Adam**
+(`--optimizer bnb8bit`), which is what fits a ~1B-parameter model in the T4's 16 GB VRAM.
 
 **Run top to bottom:**
 1. Mount Google Drive.
 2. Clone this repo (it's public — no login needed) + install dependencies.
-3. Pick your dataset — drop a `.txt` corpus into Drive (or upload it), or fall back to a
-   corpus shipped with the repo.
-4. Train on the GPU (`metis train`, `tiny` preset, 5000 steps, `cl100k_base` BPE).
-5. Re-run the cell to **resume** — checkpoints land in `MyDrive/Metis/checkpoints_train`.
+3. Download FineWeb-Edu (~2 GB text → `MyDrive/Metis/fineweb_edu.txt`). Runs once.
+4. Pick your dataset (defaults to FineWeb-Edu; drop your own `.txt` corpus in Drive to
+   override).
+5. Train (`metis train --preset 1b --optimizer bnb8bit --no-cuda-graphs`, 4000 steps ≈
+   525M tokens). Checkpoints and the tokenization cache land in
+   `MyDrive/Metis/checkpoints_1b` / `cache`, so **re-running the cell resumes** exactly
+   where you stopped — across days and sessions.
 
 **Open the notebook — one click:**
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iamasrakib/Metis/blob/main/Metis_Colab_Training.ipynb)
@@ -584,7 +594,11 @@ plain-text corpus on Colab's free T4 GPU and saves every checkpoint straight to 
 Or: Colab → **File → Open notebook → GitHub** → select `iamasrakib/Metis` →
 `Metis_Colab_Training.ipynb`.
 
-Bigger corpus/model? Raise `--iters` or switch `--preset` to `small`/`medium` in Step 4.
+**Expectations:** a 1B model runs ~1.5–3k tokens/s on a T4, so 500M tokens takes several
+Colab sessions (re-run the train cell to continue). It will be **data-limited** next to
+production 1B models (which train on 200B+ tokens), but it's a real, coherent model and
+the run resumes indefinitely. Raise `--iters` to train longer; if you hit OOM, lower
+`--batch-size` to 4.
 
 ---
 
@@ -608,6 +622,12 @@ metis distill --test-teacher
 # 3. Train forever
 metis distill --checkpoint-dir checkpoints_distill --preset tiny --tokenizer cl100k_base
 ```
+
+> **No public teacher?** Metis also works against a *local* OpenAI-compatible
+> gateway. Expose one to Colab/remote runs with `start_tunnel.bat` /
+> `stop_tunnel.bat` (a Cloudflare tunnel), then point `METIS_TEACHER_BASE_URL`
+> at the tunnel URL. Teacher calls time out after `METIS_TEACHER_TIMEOUT`
+> seconds (default 240).
 
 **Stop / resume:**
 
@@ -644,66 +664,82 @@ Other useful flags: `--topic "animals"`, `--topic-file topics.txt`,
 
 ---
 
-## Notebook
-
-A complete end-to-end pipeline is available in [`notebook.ipynb`](notebook.ipynb) — ready for **Google Colab** or local Jupyter:
-
-1. Imports dependencies
-2. Downloads or generates a dataset
-3. Trains the model via the `metis` package
-4. Demonstrates generation and interactive chat
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/)
-
----
-
 ## Project Structure
 
 ```
 Μῆτις/
-├── metis/                   # The importable Python package
-│   ├── __init__.py          # Public API (MetisLM, ModelConfig, BPETokenizer, …)
-│   ├── config.py            # Configuration system with presets & validation
-│   ├── model.py             # Transformer (RMSNorm, RoPE, SwiGLU, GQA, MoE, QK-Norm)
-│   ├── attn.py              # FlashAttention-2 dispatch layer (auto-fallback)
-│   ├── data.py              # BPETokenizer, MMapDataset, streaming, cache
-│   ├── training.py          # Training loop + DDP, EMA, W&B, LR finder
-│   ├── generate.py          # Generation & interactive chat
-│   ├── cli.py               # Unified CLI (train / chat / generate / serve / ui / info / find-lr)
-│   ├── server.py            # FastAPI REST server (OpenAI-compatible)
-│   └── webui.py             # Gradio browser chat interface
-├── benchmarks/              # Attention benchmarks (kernel / model / memory)
-│   ├── benchmark_attention.py
-│   └── results/             # Generated JSON + Markdown reports
-├── docs/
-│   ├── flash_attention.md   # FlashAttention-2 integration design & results
-│   ├── layer_prefetch.md    # Layer prefetching design & measurements
-│   ├── packing.md           # Dynamic sequence packing design & benchmarks
-│   └── pipeline.md          # Overlapped training pipeline design & measurements
-├── tests/                   # Test suite
-│   ├── test_attn.py         # Dispatch, fallback, numerical equivalence
-│   ├── test_config.py
-│   ├── test_data.py
-│   ├── test_model.py
-│   ├── test_generate.py
+├── metis/                    # The importable Python package
+│   ├── __init__.py           # Public API (MetisLM, ModelConfig, BPETokenizer, …)
+│   ├── cli.py                # Unified CLI (train / distill / generate / chat / serve / ui / info / find-lr)
+│   ├── config.py             # Configuration system with presets & validation
+│   ├── model.py              # Transformer core (RMSNorm, RoPE, SwiGLU, GQA, MoE, QK-Norm)
+│   ├── attn.py               # FlashAttention-2 dispatch layer (auto-fallback)
+│   ├── data.py               # BPETokenizer, MMapDataset, streaming, cache
+│   ├── training.py           # Training loop + DDP, EMA, W&B, LR finder
+│   ├── pipeline.py           # Overlapped training pipeline (prefetch / staging)
+│   ├── cuda_graphs.py        # CUDA-graph capture & replay
+│   ├── moe.py                # Mixture of Experts (grouped-GEMM engine)
+│   ├── expert_cache.py       # Persistent expert-weight cache
+│   ├── layer_prefetch.py     # Layer-expert prefetching
+│   ├── packing.py            # Dynamic sequence packing
+│   ├── kv.py                 # KV cache backends (default / static / quantized / MLA)
+│   ├── mla.py                # Multi-head Latent Attention
+│   ├── generate.py           # Generation & interactive chat
+│   ├── server.py             # FastAPI REST server (OpenAI-compatible)
+│   ├── webui.py              # Gradio browser chat interface
+│   ├── distill.py            # Continuous distillation from an API teacher
+│   ├── teacher.py            # Teacher API client (OpenAI-compatible)
+│   └── scheduler/            # Graph-based execution scheduler
+│       ├── graph.py          #   Computation-graph analysis
+│       ├── cost.py           #   Operator cost model
+│       ├── planner.py        #   Execution-plan construction
+│       ├── buffers.py        #   Liveness-based buffer allocation
+│       └── runtime.py        #   Execution scheduler (drop-in for model())
+├── benchmarks/               # Kernel / model / parity benchmarks
+│   ├── benchmark_*.py        # attention, block, cuda-graphs, exec-plan, …
+│   ├── verify_*_parity.py    # Bit-parity checks vs the eager path
+│   ├── profile_moe.py
+│   └── results/              # Machine-specific measured reports (gitignored)
+├── docs/                     # Design docs & reports (13)
+│   ├── flash_attention.md    # FlashAttention-2 integration design & results
+│   ├── kv_cache.md           # KV cache backends (static / quantized / MLA)
+│   ├── exec_scheduler.md     # Graph-based execution scheduler
+│   ├── moe_grouped_gemm.md   # Grouped-GEMM MoE engine
+│   ├── packing.md            # Dynamic sequence packing design & benchmarks
+│   ├── pipeline.md           # Overlapped training pipeline
+│   ├── cuda_graphs.md        # CUDA-graph capture & replay
+│   ├── expert_cache.md       # Persistent expert cache
+│   ├── layer_prefetch.md     # Layer-expert prefetching
+│   ├── fused_block.md        # Fused projections & RMSNorm
+│   ├── mla.md                # Multi-head Latent Attention
+│   ├── ARCHITECTURE_REVIEW.md
+│   └── TRAINING_REPORT_100M.md
+├── tests/                    # Pytest suite (run by CI)
+│   ├── test_attn.py          # Attention dispatch & numerical equivalence
+│   ├── test_kv.py            # KV backends (default / static / quantized / MLA)
+│   ├── test_model.py         # Model forward shapes & fused projections
+│   ├── test_generate.py      # Generation, sampling, chat
+│   ├── test_moe.py           # MoE grouped-GEMM parity
+│   ├── test_scheduler.py     # Execution-scheduler parity
+│   ├── test_pipeline.py      # Overlapped pipeline stages
+│   ├── test_cuda_graphs.py   test_expert_cache.py  test_layer_prefetch.py
+│   ├── test_packing.py       test_distill.py  test_teacher.py
+│   ├── test_config.py        test_data.py  test_cli.py  test_server.py
 │   └── __init__.py
-├── .github/workflows/       # CI pipeline
+├── .github/workflows/        # CI pipeline
 │   └── ci.yml
-├── train.py                 # Thin shim → metis train
-├── generate.py              # Thin shim → metis generate/chat
-├── chat.py                  # Thin shim → metis chat
-├── notebook.ipynb           # Colab-ready notebook
-├── pyproject.toml           # Build config & metis CLI entry point
-├── requirements.txt         # Python dependencies
-├── README.md                # This file
-├── .gitignore               # Git ignore rules
-├── LICENSE                  # MIT License
-├── data/                    # Training data (gitignored)
-│   ├── input.txt
-│   └── .gitkeep
-├── checkpoints/             # Saved models & logs (gitignored)
-└── logs/
-    └── metis.log
+├── data/                     # Dataset generators + sample corpus
+│   ├── generate_*.py         # cow / westbengal / bihar / cat / siraj datasets
+│   └── sample.txt            # Small tracked corpus (notebook fallback)
+├── Metis_Colab_Training.ipynb  # Colab GPU-training notebook
+├── train_westbengal_100m.py  # 100M West-Bengal training (see docs/TRAINING_REPORT_100M.md)
+├── start_tunnel.bat          # Expose the distill teacher gateway (Cloudflare tunnel)
+├── stop_tunnel.bat
+├── pyproject.toml            # Build config & metis CLI entry point
+├── requirements.txt          # Python dependencies
+├── README.md                 # This file
+├── .gitignore                # Git ignore rules
+└── LICENSE                   # Unlicense (public domain)
 ```
 
 ---
@@ -711,9 +747,9 @@ A complete end-to-end pipeline is available in [`notebook.ipynb`](notebook.ipynb
 ## Requirements
 
 - Python ≥ 3.10
-- PyTorch ≥ 2.0
+- PyTorch ≥ 2.4
 - tqdm
-- numpy (optional, for data processing)
+- numpy
 
 **Hardware:** Any machine will work. GPU with ≥2 GB VRAM recommended for faster training. CPU-only training is fully supported.
 

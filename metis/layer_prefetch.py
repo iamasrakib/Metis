@@ -32,7 +32,11 @@ and never appears in ``state_dict``.
 
 from __future__ import annotations
 
+import logging
+
 import torch
+
+logger = logging.getLogger("metis.layer_prefetch")
 
 __all__ = ["LayerExpertPrefetcher"]
 
@@ -115,14 +119,20 @@ class LayerExpertPrefetcher:
         self.predictions += len(preds)
         for group, dtype in preds:
             sources = [w1_views[i] for i in group] + [w2_views[i] for i in group]
-            cache.prefetch(
-                group, dtype, sources,
-                build=lambda g=group, d=dtype: (
-                    torch.stack([w1_views[i] for i in g]).to(d),
-                    torch.stack([w2_views[i] for i in g]).to(d),
-                ),
-                stream=self._stream,
-            )
+            try:
+                cache.prefetch(
+                    group, dtype, sources,
+                    build=lambda g=group, d=dtype: (
+                        torch.stack([w1_views[i] for i in g]).to(d),
+                        torch.stack([w2_views[i] for i in g]).to(d),
+                    ),
+                    stream=self._stream,
+                )
+            except Exception as e:
+                # A speculative build that fails (OOM, dtype/shape error) must
+                # never abort the current forward — a miss is harmless, so an
+                # error is skipped too. The next forward re-issues from scratch.
+                logger.warning("layer prefetch build failed (skipping): %s", e)
 
     def clear(self) -> None:
         """Drop all routing records (no stale predictions after a weight update)."""

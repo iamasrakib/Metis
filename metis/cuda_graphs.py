@@ -376,7 +376,6 @@ class CUDAGraphStep:
         self._stage_pending = True
 
     def _graph_step(self, batches, prefetch_next=None) -> tuple[float, float]:
-        N = self.gradient_accumulation_steps
         if self._stage_pending:
             # Slots were filled asynchronously for THIS iteration — wait on it.
             torch.cuda.current_stream().wait_event(self._stage_event)
@@ -424,16 +423,18 @@ class CUDAGraphStep:
     def _fallback_step(self, batches) -> tuple[float, float]:
         """Eager reference step — bit-identical to the original training loop.
 
-        Uses gradient checkpointing (as the original loop does on CUDA) so the
-        fallback is indistinguishable from a non-graph run.
+        Gradient checkpointing mirrors the eager loop's rule (on CUDA, off on
+        CPU — ``config.device.startswith('cuda')``) so the fallback is
+        indistinguishable from a non-graph run on every device, not just CUDA.
         """
         batches = list(batches)
         self.optimizer.zero_grad(set_to_none=True)
         loss_accum = 0.0
+        use_checkpointing = self.config.device.startswith("cuda")
         for x, y in batches:
             x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
             with self._autocast():
-                _, loss, _ = self.model(x, y, use_checkpointing=True)
+                _, loss, _ = self.model(x, y, use_checkpointing=use_checkpointing)
                 loss = loss / self.gradient_accumulation_steps
             self.scaler.scale(loss).backward()
             loss_accum += loss.item()

@@ -8,12 +8,11 @@ Usage:
     python -m metis.webui --checkpoint-dir checkpoints
 """
 
-import sys
-import logging
 import argparse
+import logging
+import sys
 
-from metis import load_model_and_tokenizer, generate_text
-from metis.config import setup_logging
+from metis import generate_text, load_model_and_tokenizer
 
 logger = logging.getLogger("metis.webui")
 
@@ -33,7 +32,7 @@ def main():
         model, tokenizer, config = load_model_and_tokenizer(args.checkpoint_dir, args.device)
     except Exception as e:
         print(f"❌ Failed to load model: {e}")
-        print(f"   Train one first: metis train --dataset data/input.txt")
+        print("   Train one first: metis train --dataset data/input.txt")
         sys.exit(1)
 
     # Lazily import gradio
@@ -75,7 +74,7 @@ def main():
         """
     ) as demo:
         gr.Markdown(
-            f"""
+            """
             # 🏛️ Μῆτις (Metis) v3.0
             *A modern tiny language model — built from scratch*
             """
@@ -83,7 +82,7 @@ def main():
 
         with gr.Row():
             with gr.Column(scale=3):
-                chatbot = gr.ChatInterface(
+                gr.ChatInterface(
                     chat_fn,
                     additional_inputs=[
                         gr.Slider(0.0, 2.0, value=0.8, label="Temperature", step=0.1),
@@ -98,7 +97,7 @@ def main():
 
             with gr.Column(scale=1):
                 gr.Markdown("### Model Info")
-                info = gr.JSON({
+                gr.JSON({
                     "Parameters": config.n_params,
                     "Device": config.device,
                     "Tokenizer": getattr(tokenizer, "encoding_name", "char"),

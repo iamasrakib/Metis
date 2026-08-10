@@ -62,6 +62,8 @@ CHECKPOINT_FILENAME = "latest_checkpoint.pt"
 
 _TEXT_LOG_CAP = 2_000_000          # bytes kept of the rolling text log
 _STREAM_TOKEN_CAP = 1_000_000      # max live tokens in the rolling buffer
+_TEACHER_RETRY_BASE = 10.0         # sec, doubled per consecutive teacher failure
+_TEACHER_RETRY_MAX = 120.0         # cap on the teacher-outage retry backoff
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a teacher writing plain, factual prose for a small language "
@@ -118,7 +120,7 @@ class DistillState:
 
     def load(self) -> None:
         if os.path.exists(self.path):
-            with open(self.path, "r", encoding="utf-8") as f:
+            with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
             for key, value in data.items():
                 if hasattr(self, key):
@@ -150,7 +152,7 @@ class DistillState:
 
 def _load_topics(opts: DistillOptions) -> list[str]:
     if opts.topic_file:
-        with open(opts.topic_file, "r", encoding="utf-8") as f:
+        with open(opts.topic_file, encoding="utf-8") as f:
             lines = [ln.strip() for ln in f if ln.strip()]
         if not lines:
             raise TeacherError(f"Topic file {opts.topic_file!r} is empty.")
@@ -221,18 +223,19 @@ def _build_or_load_tokenizer(config: ModelConfig, opts: DistillOptions):
     if not opts.no_resume and os.path.exists(tokenizer_path):
         # Same detection as generate.py's load_model_and_tokenizer: the saved
         # file decides the type, and load() reconstructs the exact vocab.
-        with open(tokenizer_path, "r", encoding="utf-8") as f:
+        with open(tokenizer_path, encoding="utf-8") as f:
             header = json.load(f)
         tok = BPETokenizer() if header.get("type") == "bpe" else CharTokenizer()
         tok.load(tokenizer_path)
         logger.info("Tokenizer loaded from checkpoint dir (not re-fit).")
         config.vocab_size = tok.vocab_size
+        config.pad_id = tok.pad_id
         return tok
 
     tok = _make_tokenizer(config.tokenizer)
     seed_text = ""
     if opts.seed_data:
-        with open(opts.seed_data, "r", encoding="utf-8") as f:
+        with open(opts.seed_data, encoding="utf-8") as f:
             seed_text = f.read()
     if seed_text:
         tok.fit(seed_text)
@@ -249,6 +252,7 @@ def _build_or_load_tokenizer(config: ModelConfig, opts: DistillOptions):
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     tok.save(tokenizer_path)
     config.vocab_size = tok.vocab_size
+    config.pad_id = tok.pad_id
     return tok
 
 
@@ -306,7 +310,7 @@ def _append_text_log(ckpt_dir: str, text: str, topic: str) -> None:
     path = os.path.join(ckpt_dir, TEXT_LOG_FILENAME)
     try:
         if os.path.exists(path) and os.path.getsize(path) > _TEXT_LOG_CAP:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 f.seek(os.path.getsize(path) - _TEXT_LOG_CAP // 2)
                 tail = f.read()
             with open(path, "w", encoding="utf-8") as f:
@@ -429,7 +433,11 @@ def distill(config: ModelConfig, opts: DistillOptions) -> int:
         loaded = load_checkpoint(ckpt_path, model, optimizer, config.device)
         ckpt_step = loaded["step"]
         logger.info("Weights + optimizer resumed from latest_checkpoint.pt")
-    state.load()
+    # --no-resume means "start fresh": do NOT load stale step / token-budget /
+    # topic state from a previous run, or a fresh run would immediately inherit
+    # (and possibly exceed) the old teacher-token budget.
+    if not opts.no_resume:
+        state.load()
     start_step = max(ckpt_step, state.step) + 1
     logger.info(
         f"Distillation starting at step {start_step} "
@@ -446,6 +454,7 @@ def distill(config: ModelConfig, opts: DistillOptions) -> int:
     step = start_step - 1
     t0 = time.time()
     exit_code = 0
+    consecutive_failures = 0
 
     try:
         while True:
@@ -458,11 +467,31 @@ def distill(config: ModelConfig, opts: DistillOptions) -> int:
             logger.info(
                 f"[call {state.api_calls}] teacher writing about: {topic}"
             )
-            text = teacher.complete(
-                DEFAULT_SYSTEM_PROMPT,
-                _topic_user_prompt(topic),
-                opts.max_tokens,
-            )
+            try:
+                text = teacher.complete(
+                    DEFAULT_SYSTEM_PROMPT,
+                    _topic_user_prompt(topic),
+                    opts.max_tokens,
+                )
+            except TeacherError as e:
+                # A transient teacher outage (gateway restart, a rate limit
+                # longer than the client's own retries) must NOT terminate a
+                # "run forever" loop. Log, back off with a cap, and keep
+                # trying — the _stop_reason check at the top still honors STOP
+                # files / budgets, so an operator can end the loop anytime.
+                # A permanently misconfigured teacher spins here with a visible
+                # repeated ERROR until Ctrl+C, which is the right failure mode
+                # for a loop designed to run unattended.
+                consecutive_failures += 1
+                delay = min(_TEACHER_RETRY_MAX,
+                            _TEACHER_RETRY_BASE * (2 ** (consecutive_failures - 1)))
+                logger.error(
+                    f"Teacher error (attempt {consecutive_failures}): {e}. "
+                    f"Retrying in {delay:.0f}s..."
+                )
+                time.sleep(delay)
+                continue
+            consecutive_failures = 0
             state.api_calls += 1
             usage = getattr(teacher, "last_total_tokens", None)
             state.teacher_tokens += usage if usage else _approx_tokens(text)

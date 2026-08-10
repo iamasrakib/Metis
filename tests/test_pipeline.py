@@ -10,7 +10,6 @@ prefetcher, checkpointer and parity harness run on every platform.
 """
 
 import os
-import tempfile
 import time
 
 import pytest
@@ -85,7 +84,7 @@ class TestThreadPrefetcher:
         pf = ThreadPrefetcher(loader, micro_batches=1, prefetch_depth=1)
         pf.start()
         pf.stop()
-        assert not pf._thread.is_alive() or True  # join attempted; daemon-safe
+        assert not pf._thread.is_alive()  # stop() drains the queue and joins
         pf.start()  # restartable
         try:
             pf.next_step()
@@ -292,7 +291,7 @@ class TestGpuIdleTracker:
 def test_pipeline_eager_bit_identical():
     """The overlapped eager path must reproduce the serial path's losses
     exactly (same seed, same batches, same compute)."""
-    from metis import ModelConfig, MetisLM
+    from metis import MetisLM, ModelConfig
     from metis.data import CharTokenizer, create_dataloader, train_val_split
 
     torch.manual_seed(0)

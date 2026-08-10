@@ -105,7 +105,8 @@ class TestExpertCacheUnit:
         sources = [w1, w2]
         built = (w1.clone().to(torch.bfloat16), w2.clone().to(torch.bfloat16))
         expected_remat = _remat_bytes(sources, built[0])
-        read_per = built[0].numel() * built[0].element_size() + built[1].numel() * built[1].element_size()
+        read_per = (built[0].numel() * built[0].element_size()
+                    + built[1].numel() * built[1].element_size())
         c.get_or_build((0, 1, 2), torch.bfloat16, sources, lambda: built)
         c.get_or_build((0, 1, 2), torch.bfloat16, sources, lambda: built)
         assert c.bytes_built == expected_remat
@@ -421,7 +422,9 @@ class TestOversizeEntrySkip:
         c.get_or_build((0,), torch.float32, [w], lambda: (w.clone(), w.clone()))
         assert len(c._entries) == 1
         # Large entry: 2×20×4 = 320 bytes per tensor = 640 bytes resident > 2000? No.
-        # Need actual large: 2×100×4 = 800 per tensor → 1600 resident < 2000. Let's use smaller budget.
+        # Need actual large: 2×100×4 = 800 per tensor → 1600 resident < 2000.
+        # Use a smaller budget to force eviction.
+        c2 = ExpertCache(entry_capacity=100, byte_capacity=500)
         c2 = ExpertCache(entry_capacity=100, byte_capacity=500)
         w1 = torch.randn(2, 2)
         c2.get_or_build((0,), torch.float32, [w1], lambda: (w1.clone(), w1.clone()))
@@ -520,7 +523,8 @@ class TestBytesRead:
         w2 = torch.randn(4, 2, requires_grad=True)
         sources = [w1, w2]
         built = (w1.clone(), w2.clone())
-        read_per = built[0].numel() * built[0].element_size() + built[1].numel() * built[1].element_size()
+        read_per = (built[0].numel() * built[0].element_size()
+                    + built[1].numel() * built[1].element_size())
         # 3 different groups → 3 misses
         for i in range(3):
             c.get_or_build((i,), torch.float32, sources, lambda: built)

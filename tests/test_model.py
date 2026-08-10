@@ -4,21 +4,21 @@
 
 import os
 import sys
+
 import pytest
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from metis.config import ModelConfig
 from metis.model import (
+    MLP,
+    CausalSelfAttention,
     MetisLM,
     RMSNorm,
     SwiGLU,
-    MLP,
-    CausalSelfAttention,
     TransformerBlock,
 )
-from metis.config import ModelConfig
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -56,11 +56,23 @@ class TestRMSNorm:
 
     def test_normalization(self):
         norm = RMSNorm(64)
-        x = torch.randn(2, 8, 64)
+        x = torch.randn(2, 8, 64) * 10.0  # input far from unit RMS
         y = norm(x)
-        # After RMSNorm, each feature vector should have RMS ~= 1 * weight
+        # RMSNorm removes input scale: each feature vector ends at RMS ≈ 1
+        # (weight defaults to ones).
         rms = y.pow(2).mean(-1).sqrt()
         assert rms.shape == (2, 8)
+        assert torch.allclose(rms, torch.ones_like(rms), atol=1e-4)
+
+    def test_normalization_respects_weight(self):
+        norm = RMSNorm(64)
+        norm.weight.data.fill_(3.0)
+        x = torch.randn(2, 8, 64)
+        y = norm(x)
+        rms = y.pow(2).mean(-1).sqrt()
+        # A non-unit weight scales the normalized vector (weight is ~constant
+        # per channel, so the mean RMS tracks it).
+        assert torch.allclose(rms, torch.full_like(rms, 3.0), atol=1e-2)
 
     def test_weight_shape(self):
         norm = RMSNorm(128)
@@ -219,7 +231,7 @@ class TestMetisLM:
 
     def test_parameter_count_format(self):
         config = make_config(d_model=512, n_layers=8)
-        model = MetisLM(config)
+        MetisLM(config)  # builds without error at this size
         assert "M" in config.n_params or "K" in config.n_params or "B" in config.n_params
 
     def test_gradient_checkpointing(self):

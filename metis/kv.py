@@ -48,6 +48,16 @@ import torch
 
 _QMIN, _QMAX = -127, 127
 
+# ``kv_cache_dtype`` config names → torch dtypes. There is no ``torch.fp16`` /
+# ``torch.bf16`` / ``torch.fp32`` attribute, so plain ``getattr(torch, name)``
+# raises AttributeError; this map is the single source of truth for both the
+# analytical memory model and the runtime buffer allocation.
+_DTYPE_NAMES = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
+
 
 def quantize_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric int8 quantization with a per-token scale.
@@ -83,7 +93,9 @@ def dequantize_per_token(q: torch.Tensor, scale: torch.Tensor,
 
 def _elem_bytes(dtype: torch.dtype | str) -> int:
     if isinstance(dtype, str):
-        dtype = getattr(torch, dtype) if dtype != "auto" else torch.float32
+        # "auto" → fp32 in the analytical model; any other name must be one of
+        # the config's kv_cache_dtype values (fp32/fp16/bf16).
+        dtype = _DTYPE_NAMES.get(dtype, torch.float32)
     return torch.tensor([], dtype=dtype).element_size()
 
 
@@ -191,10 +203,15 @@ class LayerKV:
 
     def _ensure(self, k: torch.Tensor) -> None:
         B, n_kv, T, D = k.shape
-        self._max_len = self.config.max_seq_len
+        # The attention sink prepends a token on cold starts, so the cache can
+        # legitimately hold max_seq_len + 1 tokens (the same +1 the RoPE
+        # frequency buffers reserve).
+        self._max_len = self.config.max_seq_len + (
+            1 if self.config.use_attention_sink else 0
+        )
         store = self.config.kv_cache_dtype
         self._store_dtype = (
-            k.dtype if store == "auto" else getattr(torch, store)
+            k.dtype if store == "auto" else _DTYPE_NAMES[store]
         )
         self._compute_dtype = k.dtype
         self._B, self._n_kv, self._D = B, n_kv, D
@@ -388,7 +405,11 @@ def cached_len_of(kv_cache) -> int:
         return first.cached_len
     if hasattr(first, "cached_len"):       # MLALayerCache or future types
         return first.cached_len
-    return first[0].size(2) if isinstance(first, (tuple, list)) else 0
+    if isinstance(first, (tuple, list)):
+        return first[0].size(2)            # list of (K, V) tuples → layer 0 K
+    if isinstance(first, torch.Tensor):
+        return first.size(2)               # bare (K, V) tuple (single layer)
+    return 0
 
 
 def cached_bytes(kv_cache) -> int:

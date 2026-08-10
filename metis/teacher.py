@@ -227,13 +227,3 @@ def build_teacher(opts) -> TeacherClient:
     except (TypeError, ValueError):
         timeout = DEFAULT_TIMEOUT
     return TeacherClient(base_url, api_key, model, timeout=timeout)
-
-
-def test_connection(client) -> str:
-    """Make one minimal call to verify the API contract. Returns the reply."""
-    return client.complete(
-        "You are a connectivity test. Reply with exactly the word OK.",
-        "Connectivity check.",
-        max_tokens=8,
-        temperature=0.0,
-    )

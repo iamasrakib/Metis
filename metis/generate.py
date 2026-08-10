@@ -7,10 +7,9 @@ Professional inference pipeline with:
   • Repetition penalty
   • Streaming output (token-by-token)
   • Interactive chat mode with conversation history
-  • CLI interface with full control over generation parameters
+  • Exposed via the `metis` CLI (`metis generate` / `metis chat`)
 """
 
-import argparse
 import json
 import logging
 import os
@@ -26,6 +25,21 @@ from .kv import cached_len_of  # KV cache subsystem (Phase 7)
 from .model import MetisLM
 
 logger = logging.getLogger("metis.generate")
+
+
+def _newline_token_id(tokenizer) -> int | None:
+    """Best-effort id of the ``"\\n"`` token, for chat turn-stop detection.
+
+    ``CharTokenizer`` exposes ``stoi`` directly; a ``BPETokenizer`` has no
+    ``stoi`` (its vocab is tiktoken's), so fall back to encoding ``"\\n"`` and
+    accept the id only if it is a single token (true for the common encodings,
+    e.g. cl100k_base maps a lone newline to one BPE token).
+    """
+    stoi = getattr(tokenizer, "stoi", None)
+    if isinstance(stoi, dict) and "\n" in stoi:
+        return stoi["\n"]
+    ids = tokenizer.encode("\n")
+    return ids[0] if len(ids) == 1 else None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -69,7 +83,13 @@ def generate_text(
         Full generated text (prompt + generated tokens).
     """
     model.eval()
-    idx = torch.tensor(tokenizer.encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
+    ids = tokenizer.encode(prompt)
+    if not ids:
+        # Empty prompt (or one whose every char is a stripped special token):
+        # seed with <bos> so the forward never sees T=0 (which crashes the
+        # RoPE slice / causal-mask paths).
+        ids = [tokenizer.bos_id]
+    idx = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
 
     # Optional execution scheduler: wraps the model in an arena-reuse infer path
     # when the env var is set (via config or CLI --exec-scheduler).
@@ -212,7 +232,9 @@ def chat(
     print(BANNER)
 
     temperature = 0.8
-    stop_token_id = tokenizer.stoi.get("\n", None)
+    stop_token_id = _newline_token_id(tokenizer)
+    history: list[str] = []          # alternating "User: …" / "Metis: …" turns
+    MAX_HISTORY_TURNS = 6            # keep the last 6 turns to bound context
 
     while True:
         try:
@@ -231,6 +253,7 @@ def chat(
                 print("\nGoodbye! 👋")
                 break
             elif cmd[0] == "/clear":
+                history.clear()
                 print("  [Conversation cleared]")
                 continue
             elif cmd[0] == "/help":
@@ -247,15 +270,19 @@ def chat(
                 print(f"  [Unknown command: {cmd[0]}]")
                 continue
 
-        # Format prompt
-        prompt = f"User: {user_input}\nMetis:"
+        # Conversation history → prompt: every prior turn is included so the
+        # model can refer back, capped to the most recent turns so a long
+        # session does not outgrow max_seq_len (generate_text also slices the
+        # prompt to max_seq_len as a final guard).
+        history.append(f"User: {user_input}")
+        history = history[-2 * MAX_HISTORY_TURNS:]
+        prompt = "\n".join(history) + "\nMetis:"
 
         # Stream response
         print("\n  Metis ❯ ", end="", flush=True)
 
         def stream_token(token: str):
-            if token != "\n":
-                print(token, end="", flush=True)
+            print(token, end="", flush=True)
 
         generated = generate_text(
             model, tokenizer, prompt,
@@ -269,11 +296,18 @@ def chat(
             stream_callback=stream_token if stream else None,
         )
 
+        response = generated[len(prompt):].strip()
         if not stream:
-            response = generated[len(prompt):].strip().split("\n")[0]
             print(response)
         else:
             print()  # Newline after streamed output
+
+        # Store the reply in history (compact: first line, matching what a
+        # "\n"-stopped turn actually delivered).
+        reply = response.split("\n")[0].strip()
+        if reply:
+            history.append(f"Metis: {reply}")
+            history = history[-2 * MAX_HISTORY_TURNS:]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -330,6 +364,7 @@ def load_model_and_tokenizer(
         sys.exit(1)
 
     config.vocab_size = tokenizer.vocab_size
+    config.pad_id = tokenizer.pad_id
 
     # Load saved config if available
     config_path = os.path.join(checkpoint_dir, "config.json")
@@ -340,6 +375,7 @@ def load_model_and_tokenizer(
         config = saved_config
         config.device = saved_device
         config.vocab_size = tokenizer.vocab_size
+        config.pad_id = tokenizer.pad_id
 
     # Optional attention-backend override (CLI / explicit request)
     if attn_backend is not None:
@@ -359,79 +395,21 @@ def load_model_and_tokenizer(
 
     if not os.path.exists(model_path):
         print("❌ Model checkpoint not found. Please train the model first.")
-        print("   Run: python train.py --dataset data/input.txt")
+        print("   Run: metis train --dataset data/input.txt")
         sys.exit(1)
 
     state_dict = torch.load(model_path, map_location=config.device, weights_only=False)
     if "model_state_dict" in state_dict:
-        model.load_state_dict(state_dict["model_state_dict"])
-    else:
-        model.load_state_dict(state_dict)
+        state_dict = state_dict["model_state_dict"]
+    # torch.compile checkpoints carry a '_orig_mod.' key prefix; a checkpoint
+    # written from a compiled model must load into this fresh, uncompiled
+    # MetisLM (same handling as training.py's load_checkpoint).
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k[len("_orig_mod."):]: v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
 
     model.to(config.device)
     model.eval()
 
     logger.info(f"Model loaded from {model_path} ({config.n_params} parameters)")
     return model, tokenizer, config
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Μῆτις (Metis) — Generate text or chat with the model",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python generate.py                              # Interactive chat\n"
-            '  python generate.py --prompt "Hello world"       # Single generation\n'
-            "  python generate.py --temperature 0.5 --top-k 20 # Adjust sampling\n"
-        ),
-    )
-    parser.add_argument("--prompt", type=str, default=None,
-                        help="Generate from this prompt (non-interactive mode)")
-    parser.add_argument("--max-tokens", type=int, default=200,
-                        help="Maximum tokens to generate (default: 200)")
-    parser.add_argument("--temperature", type=float, default=0.8,
-                        help="Sampling temperature (default: 0.8)")
-    parser.add_argument("--top-k", type=int, default=40,
-                        help="Top-k sampling (default: 40)")
-    parser.add_argument("--top-p", type=float, default=0.9,
-                        help="Nucleus sampling threshold (default: 0.9)")
-    parser.add_argument("--repetition-penalty", type=float, default=1.1,
-                        help="Repetition penalty (default: 1.1)")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints",
-                        help="Checkpoint directory (default: checkpoints)")
-    parser.add_argument("--device", type=str, default=None,
-                        help="Device override (cpu/cuda)")
-    parser.add_argument("--kv-backend", type=str, default=None, dest="kv_backend",
-                        choices=["default", "static", "quantized", "mla"],
-                        help="KV cache backend (default: saved config / "
-                             "METIS_KV_BACKEND env): default = legacy growable, "
-                             "static = preallocated buffers (bit-identical), "
-                             "quantized = int8 compressed, mla = latent attention")
-    parser.add_argument("--no-stream", action="store_true",
-                        help="Disable streaming output")
-
-    args = parser.parse_args()
-    model, tokenizer, config = load_model_and_tokenizer(
-        args.checkpoint_dir, args.device, kv_backend=args.kv_backend)
-
-    if args.prompt:
-        # Single generation mode
-        print(f"Prompt: {args.prompt}\n")
-        generated = generate_text(
-            model, tokenizer, args.prompt,
-            max_new_tokens=args.max_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            repetition_penalty=args.repetition_penalty,
-            device=config.device,
-        )
-        print(generated)
-    else:
-        # Interactive chat mode
-        chat(model, tokenizer, config, stream=not args.no_stream)
-
-
-if __name__ == "__main__":
-    main()

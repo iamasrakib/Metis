@@ -25,8 +25,8 @@ from metis.attn import (
     FLASH_ATTN,
     MATH,
     SDPA_FLASH,
-    SDPA_MEM_EFFICIENT,
     SDPA_MATH,
+    SDPA_MEM_EFFICIENT,
     causal_attention,
     detect_attention_backends,
     fused_attention_supported,
@@ -141,8 +141,20 @@ class TestDetection:
             assert report["compute_capability"] is None
 
     def test_fused_attention_supported(self):
-        """Public helper agrees with the machine capability snapshot."""
-        assert fused_attention_supported() is detect_attention_backends()["fused_available"]
+        """Public helper agrees with the per-kernel capability flags.
+
+        ``fused_available`` must be derived from the three fused-kernel probes
+        (dao flash_attn, SDPA FLASH, SDPA mem-efficient) — checking it against
+        itself (``detect_attention_backends()["fused_available"]``) would pass
+        even if a regression hardcoded both to the same wrong value.
+        """
+        report = detect_attention_backends()
+        expected = bool(
+            report.get("torch_flash")
+            or report.get("torch_mem_efficient")
+            or report.get("flash_attn")
+        )
+        assert fused_attention_supported() is expected
 
     def test_normalize_backend(self):
         assert normalize_backend("auto") == AUTO

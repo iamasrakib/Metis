@@ -60,7 +60,6 @@ ACT = "act"                # GELU (MLP fallback)
 MOE_ROUTE = "moe_route"    # gate softmax → top-k routing
 MOE_GEMM = "moe_gemm"      # grouped expert GEMM block (data-dependent shape)
 HEAD = "head"              # lm_head projection
-LOSS = "loss"              # cross-entropy
 NOOP = "noop"              # provably-dead node removed by the planner
 
 # Node kinds that produce a fresh, runtime-owned tensor (module outputs) as

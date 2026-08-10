@@ -184,10 +184,10 @@ differentiable — no detached copies.
 [edge]      idle experts / top-k=1 / single-expert crowding all match
 ```
 
-On the saved trained MoE checkpoint (`checkpoints/final_model.pt`, d=256,
-8 experts): the new engine loads the weights strictly, and grouped-vs-per-
-expert logits differ by `8.6e-6` and expert grads by `1.8e-7` — i.e. the two
-engines are numerically interchangeable on real weights.
+On the trained MoE checkpoint (d=256, 8 experts): the new engine loads
+the weights strictly, and grouped-vs-per-expert logits differ by `8.6e-6` and
+expert grads by `1.8e-7` — i.e. the two engines are numerically interchangeable
+on real weights.
 
 ## Benchmark results
 

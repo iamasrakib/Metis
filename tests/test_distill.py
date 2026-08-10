@@ -112,6 +112,57 @@ class TestResume:
 
         assert _state(ckpt)["step"] == 2  # fresh run, not continued to 4
 
+    def test_no_resume_ignores_stale_budget_state(self, tmp_path):
+        # Simulate a previous run that spent far more teacher tokens than the
+        # fresh run's budget. --no-resume must ignore this stale state, or the
+        # fresh run would immediately "reach --budget-tokens N" and exit with
+        # zero training (a run that was supposed to start over).
+        ckpt = str(tmp_path / "ckpt")
+        os.makedirs(ckpt, exist_ok=True)
+        with open(os.path.join(ckpt, "distill_state.json"), "w") as f:
+            json.dump({"step": 99, "teacher_tokens": 100_000,
+                       "api_calls": 50, "topic_index": 7,
+                       "started_ts": 0, "updated_ts": 0}, f)
+
+        rc = distill(_config(ckpt), _opts(max_steps=2, no_resume=True,
+                                          budget_tokens=2000))
+        assert rc == 0
+        state = _state(ckpt)
+        # The fresh run actually trained to max_steps instead of stopping
+        # immediately at the stale step/token counts.
+        assert state["step"] == 2
+        assert state["api_calls"] == 1            # one fresh teacher call
+        assert state["teacher_tokens"] < 2000     # fresh budget, not 100k
+
+    def test_transient_teacher_outage_does_not_kill_loop(self, tmp_path,
+                                                         monkeypatch):
+        # A "run forever" distill loop must survive a transient teacher outage
+        # (gateway restart / long rate limit) by backing off and continuing,
+        # rather than letting TeacherError terminate the process.
+        from metis import distill as distill_mod
+
+        class FlakyTeacher(distill_mod.MockTeacher):
+            def __init__(self, topics=("general knowledge",)):
+                super().__init__(topics)
+                self.failures_left = 2
+
+            def complete(self, *args, **kwargs):
+                if self.failures_left > 0:
+                    self.failures_left -= 1
+                    raise TeacherError("simulated gateway outage")
+                return super().complete(*args, **kwargs)
+
+        # Collapse the outage backoff so the test doesn't sleep real seconds.
+        monkeypatch.setattr(distill_mod, "_TEACHER_RETRY_BASE", 0.01)
+        monkeypatch.setattr(distill_mod, "_TEACHER_RETRY_MAX", 0.05)
+        monkeypatch.setattr(distill_mod, "MockTeacher", FlakyTeacher)
+
+        ckpt = str(tmp_path / "ckpt")
+        rc = distill(_config(ckpt), _opts(max_steps=2, min_sleep=0.0))
+        assert rc == 0
+        state = _state(ckpt)
+        assert state["step"] == 2  # loop survived 2 failures and finished
+
 
 class TestTeacherResolution:
     def test_build_teacher_requires_key(self, monkeypatch):

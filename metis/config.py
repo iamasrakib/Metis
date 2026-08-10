@@ -101,6 +101,18 @@ PRESETS = {
         "max_seq_len": 512,
         "description": "~35M params — full capacity, needs ≥8 GB VRAM",
     },
+    "1b": {
+        "d_model": 2048,
+        "n_heads": 16,
+        "n_kv_heads": 16,
+        "n_layers": 16,
+        "max_seq_len": 1024,
+        "learning_rate": 2e-4,
+        "warmup_steps": 1000,
+        "micro_batch_size": 8,
+        "gradient_accumulation_steps": 16,
+        "description": "~1.01B params — needs 16 GB VRAM + --optimizer bnb8bit",
+    },
 }
 
 
@@ -120,6 +132,11 @@ class ModelConfig:
 
     # ── Architecture ──────────────────────────────────────────────────────
     vocab_size: int = 256               # Updated at runtime from tokenizer
+    pad_id: int = 0                     # Padding id (loss ignore_index). Updated
+                                        # at runtime from tokenizer.pad_id — the
+                                        # char tokenizer uses 0; a BPE tokenizer
+                                        # allocates special ids above its native
+                                        # vocab, so pad_id is > 0 there.
     d_model: int = 256                  # Embedding / hidden dimension
     n_heads: int = 4                    # Number of attention heads
     n_kv_heads: int = 0                 # KV heads for GQA (0 = use n_heads = MHA)
@@ -156,6 +173,7 @@ class ModelConfig:
     weight_decay: float = 0.1           # AdamW weight decay
     warmup_steps: int = 500             # Linear warmup steps
     max_grad_norm: float = 1.0          # Gradient clipping norm
+    optimizer: str = "adamw"            # Optimizer: "adamw" | "bnb8bit" (8-bit Adam)
     val_interval: int = 100             # Validate every N iterations
     val_steps: int = 20                 # Batches per validation
     sample_interval: int = 200          # Generate sample every N iterations
@@ -243,6 +261,22 @@ class ModelConfig:
 
     def __post_init__(self):
         """Validate configuration and create directories."""
+        self.validate()
+        # Create directories
+        for d in [self.data_dir, self.checkpoint_dir, self.log_dir]:
+            os.makedirs(d, exist_ok=True)
+
+    def validate(self) -> None:
+        """Validate configuration and (re)compute derived values.
+
+        ``__post_init__`` runs this at construction. It is also re-invoked
+        after CLI overrides mutate a built config: plain attribute assignment
+        bypasses dataclass validation, so an incompatible override (e.g.
+        ``--n-kv-heads`` that doesn't divide ``n_heads``) would otherwise crash
+        later, in the first forward pass. Re-running it also refreshes the
+        derived ``head_dim`` / ``effective_batch_size`` after ``d_model`` /
+        batch-size overrides.
+        """
         # Validation
         if self.d_model % self.n_heads != 0:
             raise ValueError(
@@ -309,6 +343,11 @@ class ModelConfig:
             raise ValueError(
                 f"moe_cache_bytes must be >= 0, got {self.moe_cache_bytes}"
             )
+        _OPTIMIZERS = ("adamw", "bnb8bit")
+        if self.optimizer not in _OPTIMIZERS:
+            raise ValueError(
+                f"optimizer must be one of {_OPTIMIZERS}, got {self.optimizer!r}"
+            )
         _PACKING_STRATEGIES = ("stream", "bin")
         if self.packing_strategy not in _PACKING_STRATEGIES:
             raise ValueError(
@@ -321,14 +360,18 @@ class ModelConfig:
                 "attention sink prepends a token outside the packed layout. "
                 "Disable one of them."
             )
+        # Loop intervals must be positive — a 0 would crash train() with
+        # ``integer modulo by zero`` at runtime instead of failing here.
+        for name in ("sample_interval", "val_interval", "save_interval", "log_interval"):
+            if getattr(self, name) <= 0:
+                raise ValueError(
+                    f"{name} must be > 0 (it drives `step % {name}` in the "
+                    f"training loop), got {getattr(self, name)}"
+                )
 
         # Derived values
         self.head_dim = self.d_model // self.n_heads
         self.effective_batch_size = self.micro_batch_size * self.gradient_accumulation_steps
-
-        # Create directories
-        for d in [self.data_dir, self.checkpoint_dir, self.log_dir]:
-            os.makedirs(d, exist_ok=True)
 
     @classmethod
     def from_preset(cls, name: str, **overrides) -> "ModelConfig":

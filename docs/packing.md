@@ -64,9 +64,10 @@ positional encoding is consistent within each segment.
 
 ### Loss and labels
 
-The loss is `F.cross_entropy(..., ignore_index=0)` — identical to the existing
-pipeline. Padding tokens and segment-final tokens (after `<eos>`) are
-labelled `<pad>` (id 0) and ignored. The model only trains on real tokens.
+The loss is `F.cross_entropy(..., ignore_index=config.pad_id)` — identical to
+the existing pipeline. Padding tokens and segment-final tokens (after `<eos>`)
+are labelled `<pad>` and ignored. `pad_id` is 0 for the char tokenizer and the
+BPE pad id (≥0) otherwise; the model only trains on real tokens.
 
 ## CLI usage
 

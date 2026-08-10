@@ -33,11 +33,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["matplotlib", "pytest", "ruff"]
+test = ["pytest", "ruff", "fastapi>=0.104.0", "uvicorn>=0.24.0", "pydantic>=2.0.0", "httpx"]
 tracking = ["wandb>=0.16.0"]
-serve = ["fastapi>=0.104.0", "uvicorn>=0.24.0", "pydantic>=2.0.0"]
+serve = ["fastapi>=0.104.0", "uvicorn>=0.24.0", "pydantic>=2.0.0", "httpx"]
 ui = ["gradio>=4.0.0"]
 quant = ["bitsandbytes>=0.41.0"]
 all = ["metis-llm[dev,tracking,serve,ui,quant]"]
+
+[project.urls]
+Homepage = "https://github.com/iamasrakib/Metis"
+Repository = "https://github.com/iamasrakib/Metis"
 
 [project.scripts]
 metis = "metis.cli:main"

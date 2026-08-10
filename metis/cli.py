@@ -121,7 +121,14 @@ def _build_train_parser(subparsers) -> None:
     p.add_argument("--iters", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--grad-accum", type=int, default=None,
+                   help="Gradient accumulation steps; effective batch = "
+                        "batch-size * grad-accum (default from preset)")
     p.add_argument("--seq-len", type=int, default=None)
+    p.add_argument("--optimizer", type=str, default=None,
+                   choices=["adamw", "bnb8bit"],
+                   help="Optimizer: adamw (default) | bnb8bit (bitsandbytes 8-bit Adam, "
+                        "fits ~1B-param models in 16 GB VRAM)")
     p.add_argument("--n-kv-heads", type=int, default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -179,6 +186,9 @@ def _build_train_parser(subparsers) -> None:
     # Phase 1: Data
     p.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
     p.add_argument("--no-mmap", action="store_true", help="Disable memory-mapped dataset")
+    p.add_argument("--force-recache", action="store_true",
+                   help="Rebuild the tokenized data cache from scratch, ignoring "
+                        "any existing cache file")
     # Phase 5: Dynamic Sequence Packing
     p.add_argument("--use-packing", action="store_true",
                    help="Enable dynamic sequence packing (packs short documents "
@@ -361,8 +371,12 @@ def _build_train_config(args) -> ModelConfig:
         config.learning_rate = args.lr
     if args.batch_size is not None:
         config.micro_batch_size = args.batch_size
+    if args.grad_accum is not None:
+        config.gradient_accumulation_steps = args.grad_accum
     if args.seq_len is not None:
         config.max_seq_len = args.seq_len
+    if args.optimizer is not None:
+        config.optimizer = args.optimizer
     if args.n_kv_heads is not None:
         config.n_kv_heads = args.n_kv_heads
     if args.tokenizer is not None:
@@ -419,6 +433,11 @@ def _build_train_config(args) -> ModelConfig:
     config.force_recache = getattr(args, "force_recache", False)
     config.use_packing = getattr(args, "use_packing", False)
     config.packing_strategy = getattr(args, "packing_strategy", None) or config.packing_strategy
+    # Re-validate after CLI overrides: attribute assignment bypasses the
+    # dataclass __post_init__ checks (e.g. an incompatible --n-kv-heads would
+    # otherwise crash in the first forward pass), and refreshes the derived
+    # head_dim / effective_batch_size fields.
+    config.validate()
     return config
 
 
@@ -460,6 +479,8 @@ def _build_distill_config(args) -> ModelConfig:
     config.use_pipeline = False
     config.use_cuda_graphs = False
     config.use_packing = False
+    # Re-validate after CLI overrides (see _build_train_config).
+    config.validate()
     return config
 
 

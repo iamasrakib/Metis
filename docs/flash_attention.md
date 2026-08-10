@@ -243,7 +243,7 @@ between fitting a training run on the GPU or not.
 ### Results on the reference machine
 
 Machine: **RTX 2050 (sm_86, 4 GB), torch 2.6.0+cu124, Windows**, `auto` →
-`sdpa_mem_efficient`. Full report: [`benchmarks/results/benchmark.md`](../benchmarks/results/benchmark.md).
+`sdpa_mem_efficient`. Full report: timestamped Markdown/JSON in `benchmarks/results/`.
 
 **Kernel-level attention (fp16)** — speedup of the fused dispatch over the
 exact manual math, MHA and GQA, prefill and decode:

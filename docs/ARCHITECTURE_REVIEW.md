@@ -2,7 +2,7 @@
 
 **Reviewer**: Principal AI Systems Architect
 **Date**: 2026-08-03
-**Codebase**: Metis v3.0 — 24 source files, ~10,700 lines of Python
+**Codebase**: Metis v3.0 — 26 source files, ~10,700 lines of Python
 **Target Hardware**: NVIDIA RTX 2050 (4 GB VRAM)
 
 ---
@@ -11,7 +11,7 @@
 
 Metis is a from-scratch decoder-only transformer LLM framework that is **already in strong production-ready shape**. The codebase demonstrates mature engineering: fused operators (QKV, SwiGLU w13), a pluggable KV-cache subsystem with four backends, grouped MoE with dynamic scheduling, a graph-based execution scheduler, CUDA graph capture for training, an overlapped I/O pipeline, persistent expert caching with thread-safe LRU, and a clean CLI/API/UI surface.
 
-After a complete audit of all 24 source files and 14 test files, **no correctness bugs, no race conditions, no silent numerical regressions, and no dead code paths** were found. The architecture is internally consistent and well-integrated. The changes made were limited to version alignment, dependency floor correction, a determinism contradiction fix, and dead-code cleanup — all verified by the full test suite (315 passed, 27 skipped, 0 failures).
+After a complete audit of all 26 source files and 17 test files, **no correctness bugs, no race conditions, no silent numerical regressions, and no dead code paths** were found. The architecture is internally consistent and well-integrated. The changes made were limited to version alignment, dependency floor correction, a determinism contradiction fix, and dead-code cleanup — all verified by the full test suite (315 passed, 27 skipped, 0 failures at the time of review; the suite has since grown).
 
 ---
 
@@ -197,7 +197,7 @@ These are **not defects** — they are potential enhancements for future work:
 | **Performance** | ✅ Strong | Fused operators, CUDA graphs, overlapped pipeline, expert cache all properly implemented. |
 | **Stability** | ✅ Excellent | 315 tests pass. Determinism ensured (after fix). Thread safety verified. |
 | **Maintainability** | ✅ Good | Clean module boundaries, comprehensive docstrings, consistent naming. |
-| **Documentation** | ✅ Good | 11 doc files, inline docstrings on all public APIs, README with examples. |
+| **Documentation** | ✅ Good | 13 doc files, inline docstrings on all public APIs, README with examples. |
 | **Backward Compat** | ✅ Excellent | Fused QKV/w13 state_dict hooks preserve checkpoint compatibility. |
 | **Hardware Coverage** | ✅ Good | CPU + CUDA fallback paths for every subsystem. Graceful degradation. |
 

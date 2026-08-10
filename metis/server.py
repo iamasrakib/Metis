@@ -10,31 +10,29 @@ FastAPI-based inference server with:
   • OpenAI-compatible /v1/chat/completions endpoint
 """
 
+import json
+import logging
 import os
 import sys
-import json
-import time
-import logging
-from typing import Optional, List, Dict, Any, Union
 import threading
+import time
 from contextlib import asynccontextmanager
-from queue import Queue, Empty
+from queue import Empty, Queue
 
-import torch
-import uvicorn
 from pydantic import BaseModel, Field
 
 try:
-    from fastapi import FastAPI, HTTPException, Query, Request
-    from fastapi.responses import StreamingResponse, JSONResponse
+    from fastapi import Depends, FastAPI, Header, HTTPException
+    from fastapi.concurrency import run_in_threadpool
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import StreamingResponse
 except ImportError:
     print("❌ fastapi not installed. Run: pip install fastapi uvicorn")
     sys.exit(1)
 
 from metis import (
-    MetisLM, ModelConfig, BPETokenizer, CharTokenizer,
-    generate_text, load_model_and_tokenizer,
+    generate_text,
+    load_model_and_tokenizer,
 )
 
 logger = logging.getLogger("metis.server")
@@ -49,11 +47,11 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(..., description="Text prompt to generate from")
     max_tokens: int = Field(200, ge=1, le=4096, description="Max tokens to generate")
     temperature: float = Field(0.8, ge=0.0, le=2.0, description="Sampling temperature")
-    top_k: Optional[int] = Field(40, ge=0, description="Top-k filtering")
-    top_p: Optional[float] = Field(0.9, ge=0.0, le=1.0, description="Nucleus sampling")
+    top_k: int | None = Field(40, ge=0, description="Top-k filtering")
+    top_p: float | None = Field(0.9, ge=0.0, le=1.0, description="Nucleus sampling")
     repetition_penalty: float = Field(1.1, ge=1.0, le=5.0, description="Repetition penalty")
     stream: bool = Field(False, description="Stream tokens via SSE")
-    stop: Optional[str] = Field(None, description="Stop string")
+    stop: str | None = Field(None, description="Stop string")
 
 
 class ChatMessage(BaseModel):
@@ -62,11 +60,11 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    messages: List[ChatMessage] = Field(..., description="Chat messages")
+    messages: list[ChatMessage] = Field(..., description="Chat messages")
     max_tokens: int = Field(200, ge=1, le=4096)
     temperature: float = Field(0.8, ge=0.0, le=2.0)
-    top_k: Optional[int] = Field(40)
-    top_p: Optional[float] = Field(0.9)
+    top_k: int | None = Field(40)
+    top_p: float | None = Field(0.9)
     stream: bool = Field(False)
 
 
@@ -91,24 +89,42 @@ class ModelInfo(BaseModel):
 
 class OpenAICompletionRequest(BaseModel):
     model: str = "metis-3.0"
-    prompt: Union[str, List[str]] = ""
-    max_tokens: int = 200
-    temperature: float = 0.8
-    top_p: float = 0.9
+    prompt: str | list[str] = ""
+    max_tokens: int = Field(200, ge=1, le=4096,
+                            description="Max tokens to generate")
+    temperature: float = Field(0.8, ge=0.0, le=2.0)
+    top_p: float = Field(0.9, ge=0.0, le=1.0)
     stream: bool = False
-    stop: Optional[Union[str, List[str]]] = None
+    stop: str | list[str] | None = None
 
 
 class OpenAIChatRequest(BaseModel):
     model: str = "metis-3.0"
-    messages: List[Dict[str, str]] = []
-    max_tokens: int = 200
-    temperature: float = 0.8
-    top_p: float = 0.9
+    messages: list[dict[str, str]] = []
+    max_tokens: int = Field(200, ge=1, le=4096,
+                            description="Max tokens to generate")
+    temperature: float = Field(0.8, ge=0.0, le=2.0)
+    top_p: float = Field(0.9, ge=0.0, le=1.0)
     stream: bool = False
 
 
 # ── Server Setup ──────────────────────────────────────────────────────────────
+
+async def _require_auth(authorization: str | None = Header(default=None)) -> None:
+    """Optional bearer-token auth for the generation endpoints.
+
+    The server binds 0.0.0.0 by default, so without auth anyone who can reach
+    the port can burn GPU/API tokens. When ``METIS_API_KEY`` is set, requests
+    must send ``Authorization: Bearer <key>`` (401 otherwise). When unset the
+    server stays open — intended for local / trusted-network usage — so
+    enabling auth never breaks an existing deployment.
+    """
+    api_key = os.environ.get("METIS_API_KEY")
+    if not api_key:
+        return
+    if authorization != f"Bearer {api_key}":
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -122,6 +138,12 @@ async def lifespan(app: FastAPI):
         model_globals["tokenizer"] = tokenizer
         model_globals["config"] = config
         logger.info(f"Model loaded: {config.n_params} params, device={config.device}")
+    except SystemExit:
+        # load_model_and_tokenizer calls sys.exit(1) when checkpoints are
+        # missing (fine for the CLI, but a server must keep running — /health
+        # and /info stay up so operators can see the "no_model" state).
+        logger.error("Failed to load model: checkpoints/tokenizer not found")
+        logger.error("Start with: METIS_CHECKPOINT_DIR=path/to/checkpoints metis serve")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         logger.error("Start with: METIS_CHECKPOINT_DIR=path/to/checkpoints metis serve")
@@ -135,10 +157,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS: default to wide-open (any origin), overridable via METIS_CORS_ORIGINS
+# as a comma-separated list. ``allow_credentials=True`` is incompatible with a
+# wildcard origin (browsers ignore the credential header), so credentials are
+# only enabled when an explicit origin list is configured.
+_cors_origins = [
+    o.strip() for o in os.environ.get("METIS_CORS_ORIGINS", "*").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_origins != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -166,26 +196,49 @@ def _generate(prompt: str, req: GenerateRequest) -> str:
     )
 
 
-async def _stream_generator(prompt: str, req: GenerateRequest):
-    """Async generator for streaming generation with real-time token delivery."""
+def _strip_prompt(text: str, prompt: str, tokenizer) -> str:
+    """Remove the tokenizer-faithful prefix of ``prompt`` from generated text.
+
+    ``generate_text`` returns ``decode(encode(prompt) + new_ids)``. For a char
+    tokenizer that decoded prefix equals ``prompt``, so a plain
+    ``text[len(prompt):]`` slice is exact; for BPE tokenizers (cl100k_base,
+    o200k_base) Unicode normalization can make the decoded prefix differ from
+    the input string and a character-count slice then starts mid-token. Strip
+    using the tokenizer's own round-trip so the boundary is token-aligned, and
+    fall back to the full text if the prefix does not match (never truncate a
+    response into the middle of a word).
+    """
+    if not prompt or tokenizer is None:
+        return text
+    prefix = tokenizer.decode(tokenizer.encode(prompt))
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+async def _stream_tokens(prompt: str, req: GenerateRequest):
+    """Run ``generate_text`` in a daemon thread, yielding ``(type, payload)``.
+
+    Generation is CPU/GPU-bound and must not block the async event loop, so it
+    runs in a background thread that pushes tokens into a queue. Any exception
+    in the thread is captured and re-raised in this async frame, so a
+    mid-generation failure (CUDA OOM, dtype/shape error) surfaces as a visible
+    error instead of silently dying in the thread and leaving the client to
+    hang waiting for a ``[DONE]`` that never differs from a live stream.
+    """
     model = model_globals["model"]
     tokenizer = model_globals["tokenizer"]
     config = model_globals["config"]
     if model is None:
-        yield f"data: {json.dumps({'error': 'Model not loaded'})}\n\n"
-        yield "data: [DONE]\n\n"
-        return
+        raise HTTPException(status_code=503, detail="Model not loaded")
 
-    # Use a queue to receive tokens from the generation thread
     token_queue: Queue = Queue()
     done_event = threading.Event()
+    failure: dict[str, Exception] = {}
 
     def stream_token(token: str):
         """Called from the generation thread for each token."""
         token_queue.put(("token", token))
 
     def generate_in_thread():
-        """Run generation in a separate thread, streaming tokens."""
         try:
             generate_text(
                 model, tokenizer, prompt,
@@ -198,22 +251,72 @@ async def _stream_generator(prompt: str, req: GenerateRequest):
                 stop_string=req.stop,
                 stream_callback=stream_token,
             )
+        except Exception as e:
+            failure["exception"] = e
         finally:
             done_event.set()
 
-    # Start generation in background thread
     thread = threading.Thread(target=generate_in_thread, daemon=True)
     thread.start()
 
-    # Yield tokens as they arrive from the queue
     while not done_event.is_set() or not token_queue.empty():
         try:
             event_type, data = token_queue.get(timeout=0.1)
-            yield f"data: {json.dumps({'token': data})}\n\n"
+            yield event_type, data
         except Empty:
             continue
 
-    # Send final done signal
+    if "exception" in failure:
+        raise failure["exception"]
+
+
+async def _stream_generator(prompt: str, req: GenerateRequest):
+    """SSE generator for the proprietary stream path (used by /generate, /chat)."""
+    try:
+        async for _, token in _stream_tokens(prompt, req):
+            yield f"data: {json.dumps({'token': token})}\n\n"
+    except HTTPException as e:
+        yield f"data: {json.dumps({'error': e.detail})}\n\n"
+    except Exception as e:
+        logger.exception("Streaming generation failed")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+async def _openai_stream_generator(prompt: str, req: GenerateRequest, *,
+                                   chat: bool, model_name: str, req_id: str):
+    """Yield OpenAI-compatible SSE chunks for /v1/completions or /v1/chat."""
+    created = int(time.time())
+    obj = "chat.completion.chunk" if chat else "text_completion"
+    try:
+        async for _, token in _stream_tokens(prompt, req):
+            if chat:
+                chunk = {"id": req_id, "object": obj, "created": created,
+                         "model": model_name,
+                         "choices": [{"index": 0, "delta": {"content": token},
+                                      "finish_reason": None}]}
+            else:
+                chunk = {"id": req_id, "object": obj, "created": created,
+                         "model": model_name,
+                         "choices": [{"index": 0, "text": token,
+                                      "finish_reason": None}]}
+            yield f"data: {json.dumps(chunk)}\n\n"
+    except Exception as e:
+        logger.exception("Streaming generation failed")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        # Always terminate the stream: OpenAI clients wait for the [DONE]
+        # sentinel, so a bare return would leave them hanging on the error path.
+        yield "data: [DONE]\n\n"
+        return
+
+    # Final chunk carries the finish_reason (required by OpenAI clients).
+    finish = {"id": req_id, "object": obj, "created": created, "model": model_name,
+              "choices": [{"index": 0, "finish_reason": "stop"}]}
+    if chat:
+        finish["choices"][0]["delta"] = {}
+    else:
+        finish["choices"][0]["text"] = ""
+    yield f"data: {json.dumps(finish)}\n\n"
     yield "data: [DONE]\n\n"
 
 
@@ -231,13 +334,22 @@ async def root():
 
 
 @app.post("/generate", response_model=GenerateResponse)
-async def generate(req: GenerateRequest):
+async def generate(req: GenerateRequest, _auth: None = Depends(_require_auth)):
     """Generate text from a prompt."""
     if model_globals["model"] is None:
         raise HTTPException(status_code=503, detail="Model not loaded (train one first)")
 
+    if req.stream:
+        return StreamingResponse(
+            _stream_generator(req.prompt, req),
+            media_type="text/event-stream",
+        )
+
     t0 = time.time()
-    text = _generate(req.prompt, req)
+    # generate_text is synchronous and CPU/GPU-bound: run it off the event
+    # loop so a long generation does not stall every other request (health,
+    # info, and concurrent completions).
+    text = await run_in_threadpool(_generate, req.prompt, req)
     elapsed = (time.time() - t0) * 1000
     tokenizer = model_globals["tokenizer"]
 
@@ -249,7 +361,7 @@ async def generate(req: GenerateRequest):
 
 
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest):
+async def chat_endpoint(req: ChatRequest, _auth: None = Depends(_require_auth)):
     """Chat with the model using message history."""
     if model_globals["model"] is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -280,8 +392,8 @@ async def chat_endpoint(req: ChatRequest):
             media_type="text/event-stream",
         )
 
-    text = _generate(prompt, gen_req)
-    response_text = text[len(prompt):].strip().split("\n")[0]
+    text = await run_in_threadpool(_generate, prompt, gen_req)
+    response_text = _strip_prompt(text, prompt, model_globals["tokenizer"]).strip().split("\n")[0]
     return {"response": response_text, "role": "assistant"}
 
 
@@ -306,15 +418,21 @@ async def info():
         device=config.device,
         max_seq_len=config.max_seq_len,
         vocab_size=config.vocab_size,
-        dtype=str(next(model_globals["model"].parameters()).dtype) if model_globals["model"] else "unknown",
+        dtype=(
+            str(next(model_globals["model"].parameters()).dtype)
+            if model_globals["model"] else "unknown"
+        ),
     )
 
 
 # ── OpenAI-compatible endpoints ───────────────────────────────────────────────
 
 @app.post("/v1/completions")
-async def openai_completions(req: OpenAICompletionRequest):
+async def openai_completions(req: OpenAICompletionRequest,
+                             _auth: None = Depends(_require_auth)):
     """OpenAI-compatible completions endpoint."""
+    if model_globals["model"] is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
     prompt = req.prompt if isinstance(req.prompt, str) else req.prompt[0]
     gen_req = GenerateRequest(
         prompt=prompt,
@@ -325,32 +443,43 @@ async def openai_completions(req: OpenAICompletionRequest):
         stop=req.stop[0] if isinstance(req.stop, list) else req.stop,
     )
 
-    t0 = time.time()
-    text = _generate(prompt, gen_req) if model_globals["model"] else ""
-    elapsed = time.time() - t0
+    req_id = f"cmpl-{int(time.time())}"
+    if req.stream:
+        return StreamingResponse(
+            _openai_stream_generator(prompt, gen_req, chat=False,
+                                     model_name=req.model, req_id=req_id),
+            media_type="text/event-stream",
+        )
 
-    response = {
-        "id": f"cmpl-{int(time.time())}",
+    text = await run_in_threadpool(_generate, prompt, gen_req)
+    tokenizer = model_globals["tokenizer"]
+    generated = _strip_prompt(text, prompt, tokenizer)
+    prompt_tokens = len(tokenizer.encode(prompt)) if tokenizer else 0
+    completion_tokens = len(tokenizer.encode(generated)) if tokenizer else 0
+
+    return {
+        "id": req_id,
         "object": "text_completion",
         "created": int(time.time()),
         "model": req.model,
         "choices": [{
-            "text": text[len(prompt):] if text.startswith(prompt) else text,
+            "text": generated,
             "index": 0,
             "finish_reason": "stop",
         }],
         "usage": {
-            "prompt_tokens": len(model_globals["tokenizer"].encode(prompt)) if model_globals["tokenizer"] else 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     }
-    return response
 
 
 @app.post("/v1/chat/completions")
-async def openai_chat(req: OpenAIChatRequest):
+async def openai_chat(req: OpenAIChatRequest, _auth: None = Depends(_require_auth)):
     """OpenAI-compatible chat completions endpoint."""
+    if model_globals["model"] is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
     # Format messages
     prompt = ""
     for msg in req.messages:
@@ -372,13 +501,22 @@ async def openai_chat(req: OpenAIChatRequest):
         stream=req.stream,
     )
 
-    t0 = time.time()
-    text = _generate(prompt, gen_req) if model_globals["model"] else ""
-    elapsed = time.time() - t0
-    response_text = text[len(prompt):].strip().split("\n")[0]
+    req_id = f"chatcmpl-{int(time.time())}"
+    if req.stream:
+        return StreamingResponse(
+            _openai_stream_generator(prompt, gen_req, chat=True,
+                                     model_name=req.model, req_id=req_id),
+            media_type="text/event-stream",
+        )
+
+    text = await run_in_threadpool(_generate, prompt, gen_req)
+    tokenizer = model_globals["tokenizer"]
+    response_text = _strip_prompt(text, prompt, tokenizer).strip().split("\n")[0]
+    prompt_tokens = len(tokenizer.encode(prompt)) if tokenizer else 0
+    completion_tokens = len(tokenizer.encode(response_text)) if tokenizer else 0
 
     return {
-        "id": f"chatcmpl-{int(time.time())}",
+        "id": req_id,
         "object": "chat.completion",
         "created": int(time.time()),
         "model": req.model,
@@ -388,9 +526,9 @@ async def openai_chat(req: OpenAIChatRequest):
             "finish_reason": "stop",
         }],
         "usage": {
-            "prompt_tokens": len(model_globals["tokenizer"].encode(prompt)),
-            "completion_tokens": len(model_globals["tokenizer"].encode(response_text)),
-            "total_tokens": len(model_globals["tokenizer"].encode(prompt + response_text)),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     }
 
@@ -411,6 +549,9 @@ async def health():
 def main():
     """Start the API server."""
     import argparse
+
+    import uvicorn
+
     parser = argparse.ArgumentParser(description="Metis API Server")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
@@ -424,7 +565,7 @@ def main():
     if args.device:
         os.environ["METIS_DEVICE"] = args.device
 
-    print(f"\n  Μῆτις API Server v3.0")
+    print("\n  Μῆτις API Server v3.0")
     print(f"  Docs:  http://{args.host}:{args.port}/docs")
     print(f"  Info:  http://{args.host}:{args.port}/info")
     print(f"  Chat:  POST http://{args.host}:{args.port}/chat")

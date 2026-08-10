@@ -287,10 +287,17 @@ class MLAAttention(nn.Module):
             q_full = torch.cat([q_content, q_rope], dim=-1)
 
             backend_log = []
+            # ``scale=self.scale`` is REQUIRED for KV-cache equivalence: the
+            # absorbed decode path multiplies scores by ``self.scale``, and the
+            # explicit-prefill path must use the identical temperature or the
+            # same sequence produces different logits before/after the cache
+            # is warm (causal_attention's default 1/sqrt(q_head_dim) differs
+            # from self.scale when mla_scale_head_dim=False, the default).
             y = causal_attention(
                 q_full, k, v,
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
                 is_causal=True,
+                scale=self.scale,
                 n_heads=self.n_heads, n_kv_heads=self.n_heads,
                 backend=self.backend_request, use_flash_attn=self.use_flash_attn,
                 training=self.training,

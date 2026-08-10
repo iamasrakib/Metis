@@ -4,16 +4,14 @@
 
 import os
 import sys
+
 import pytest
-import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from metis.data import BPETokenizer, CharTokenizer
 from metis.generate import generate_text
 from metis.model import MetisLM
-from metis.config import ModelConfig
-from metis.data import CharTokenizer, BPETokenizer
-
 from tests.test_model import make_config
 
 # ── Skip tests if not enough VRAM
@@ -111,3 +109,24 @@ class TestChatFunction:
     def test_chat_imports(self):
         from metis.generate import chat
         assert callable(chat)
+
+    def test_newline_token_id_char(self):
+        """CharTokenizer exposes stoi directly."""
+        from metis.generate import _newline_token_id
+        tok = CharTokenizer()
+        tok.fit("hello\nworld")
+        assert _newline_token_id(tok) == tok.stoi["\n"]
+
+    def test_newline_token_id_bpe_no_stoi(self):
+        """Regression: chat turn-stop must not crash on a BPE tokenizer.
+
+        A ``BPETokenizer`` has no ``stoi`` (its vocab is tiktoken's) — the old
+        code did ``tokenizer.stoi["\\n"]`` and crashed. ``_newline_token_id``
+        must fall back to encoding ``"\\n"``.
+        """
+        from metis.generate import _newline_token_id
+        tok = BPETokenizer(encoding_name="gpt2")
+        assert not hasattr(tok, "stoi")
+        nid = _newline_token_id(tok)
+        assert nid is not None
+        assert tok.decode([nid]) == "\n"

@@ -21,7 +21,6 @@ from metis.scheduler import (
     INFER,
     NOOP,
     TRAIN,
-    Arena,
     ComputationGraph,
     ExecutionPlan,
     analyze_model,
@@ -216,8 +215,9 @@ class TestBuffers:
         g.nodes[b].order = 1
         g.nodes[b].dead_at = 1
         result = assign([g.nodes[a], g.nodes[b]])
-        assert result.slots >= 1
-        assert result.reuse_count >= 1 or result.slots == 1
+        # b is born after a dies → it must reuse a's slot exactly.
+        assert result.slots == 1
+        assert result.reuse_count == 1
 
     def test_overlap_needs_two_slots(self):
         g = ComputationGraph()
@@ -230,7 +230,7 @@ class TestBuffers:
         result = assign([g.nodes[a], g.nodes[b]])
         assert result.slots >= 2  # need 2 slots
 
-    def test_savings_positive(self):
+    def test_arena_below_naive(self):
         g = ComputationGraph()
         a = g.add("gemm", "a", "a", (1,), bytes=100)
         b = g.add("gemm", "b", "b", (1,), deps={a}, bytes=200)
@@ -250,28 +250,6 @@ class TestBuffers:
         peak = assign([g.nodes[a], g.nodes[b]]).naive_peak
         # a: live at pos 0 (100), b: live at pos 1 (200) -> peak 200
         assert peak >= 200
-
-    def test_arena_acquire_reuses(self):
-        arena = Arena("cpu")
-        a = arena.acquire(0, (10, 10), torch.float32)
-        assert arena.alloc_count == 1
-        b = arena.acquire(0, (5, 5), torch.float32)  # smaller, same slot
-        assert arena.reuse_count == 1
-        assert a.data_ptr() == b.data_ptr()  # same buffer
-
-    def test_arena_grows(self):
-        arena = Arena("cpu")
-        arena.acquire(0, (5, 5), torch.float32)
-        b = arena.acquire(0, (10, 10), torch.float32)  # bigger, must realloc
-        assert arena.alloc_count == 2
-        assert b.numel() == 100
-
-    def test_arena_peak_tracking(self):
-        arena = Arena("cpu")
-        arena.acquire(0, (10, 10), torch.float32)  # 400 bytes
-        assert arena.peak_bytes == 400
-        arena.acquire(1, (20, 20), torch.float32)  # 1600 bytes
-        assert arena.peak_bytes == 1600
 
 
 # ── Planner tests ────────────────────────────────────────────────────────
@@ -391,6 +369,28 @@ class TestInferParity:
             log_e, _, cache_e = model(tok, kv_cache=cache_e)
             assert torch.equal(log_s, log_e), f"mismatch at decode step {step}"
 
+    def test_decode_match_no_rope(self):
+        """Non-RoPE positional path: decode positions advance via cache length.
+
+        Regression for the scheduler runtime's non-RoPE branch — without RoPE
+        the absolute position of a decode step comes from the KV cache length
+        (``cached_len_of(kv_cache)``), which the eager model and the scheduler
+        must agree on token-for-token.
+        """
+        model = make_model(use_rope=False)
+        model.eval()
+        sched = build_scheduler(model, mode=INFER, calibrate_run=False,
+                                ref_shape=(1, 16))
+        idx = torch.randint(0, 256, (1, 16))
+        with torch.no_grad():
+            _, _, cache = sched.execute(idx)
+            _, _, cache_e = model(idx)
+        for step in range(5):
+            tok = torch.randint(0, 256, (1, 1))
+            log_s, _, cache = sched.execute(tok, kv_cache=cache)
+            log_e, _, cache_e = model(tok, kv_cache=cache_e)
+            assert torch.equal(log_s, log_e), f"mismatch at decode step {step}"
+
     def test_prefill_with_targets(self):
         model = make_model()
         model.eval()
@@ -488,15 +488,13 @@ class TestInferParity:
                               "..", "metis", "scheduler", "runtime.py"),
                  encoding="utf-8").read()
         )
+        # Docstrings are ``ast.Constant`` (str) nodes, so any Attribute hit here
+        # is real code — a host-side sync in the hot loop.
         for node in ast.walk(source):
-            if isinstance(node, ast.Attribute):
-                if node.attr in ("item", "cpu", "synchronize"):
-                    # Allow in docstrings/strings but not in function bodies
-                    pass
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Attribute):
-                    assert node.func.attr not in ("synchronize",), \
-                        "synchronize() call found in runtime source"
+            assert not (
+                isinstance(node, ast.Attribute)
+                and node.attr in ("item", "cpu", "synchronize")
+            ), f"host-sync call {node.attr!r} found in runtime source"
 
 
 class TestTrainParity:

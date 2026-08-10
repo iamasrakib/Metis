@@ -12,9 +12,6 @@ Two pieces:
   live tensors. In this model the residual stream collapses to **one rolling
   slot** (in-place ``add_``), which is the difference between ``~9·n_layers``
   activation tensors and a handful.
-* ``Arena`` — the **runtime's** container: a set of slot buffers allocated
-  lazily at first use (and grown if a later shape exceeds the reference),
-  with allocation/reuse counters for the benchmark.
 
 Correctness rule
 ----------------
@@ -28,8 +25,6 @@ therefore never aliases a training-mode tensor.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-
-import torch
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Planner-side analysis
@@ -62,12 +57,6 @@ class BufferAssignment:
     naive_peak: int = 0           # baseline without reuse
     reuse_count: int = 0          # nodes that landed on a freed slot
     slots: int = 0
-
-    def savings(self) -> float:
-        """Fraction of naive peak avoided (1.0 = zero live waste)."""
-        if self.naive_peak <= 0:
-            return 0.0
-        return 1.0 - self.arena_bytes / self.naive_peak
 
 
 def assign(nodes) -> BufferAssignment:
@@ -106,60 +95,3 @@ def assign(nodes) -> BufferAssignment:
         reuse_count=reuse,
         slots=next_slot,
     )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Runtime-side container
-# ──────────────────────────────────────────────────────────────────────────────
-
-class Arena:
-    """A pool of reusable slot buffers, allocated lazily and grown on demand.
-
-    The runtime uses one slot for the rolling residual stream; the generic
-    class supports many slots so the same mechanism works for any graph the
-    planner assigns. Allocation happens on first use and when a request
-    exceeds the current slot size — every subsequent use is a *reuse*.
-    """
-
-    def __init__(self, device: str):
-        self.device = device
-        self._slots: dict[int, torch.Tensor] = {}
-        self.alloc_count = 0     # tensor allocations made
-        self.reuse_count = 0     # requests satisfied by an existing buffer
-        self.peak_bytes = 0
-
-    def acquire(self, slot: int, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
-        """Return a buffer for ``slot`` sized to at least ``shape``."""
-        buf = self._slots.get(slot)
-        if buf is not None and _fits(buf.shape, shape):
-            self.reuse_count += 1
-            self._track(buf)
-            return buf
-        new = torch.empty(shape, dtype=dtype, device=self.device)
-        self._slots[slot] = new
-        self.alloc_count += 1
-        self._track(new)
-        return new
-
-    def release(self, slot: int) -> None:
-        """Free a slot (returns its memory to the pool on CUDA)."""
-        if slot in self._slots:
-            self._slots[slot].resize_(0)
-            self._slots.pop(slot, None)
-
-    def _track(self, buf: torch.Tensor) -> None:
-        self.peak_bytes = max(self.peak_bytes, buf.numel() * buf.element_size())
-
-    def stats(self) -> dict:
-        return {
-            "slots": len(self._slots),
-            "alloc_count": self.alloc_count,
-            "reuse_count": self.reuse_count,
-            "peak_bytes": self.peak_bytes,
-        }
-
-
-def _fits(buf_shape: tuple, shape: tuple) -> bool:
-    """True if ``buf_shape`` can serve a request for ``shape`` (same rank,
-    every dim ≥, same dtype)."""
-    return len(buf_shape) == len(shape) and all(b >= s for b, s in zip(buf_shape, shape))

@@ -45,7 +45,7 @@ Each cache entry stores:
   is `torch.is_grad_enabled() and any(t.requires_grad for t in sources)`,
   so inference (no-grad) and training (grad) builds never collide.
 - **Value**: cached `(w1_group, w2_group)` stacked + cast tensors.
-- **Staleness signature**: `tuple((data_ptr, _version) for t in sources)`.
+- **Staleness signature**: `tuple((data_ptr, _version, shape) for t in sources)`.
   On lookup, the current signature is recomputed; a mismatch → stale → rebuild.
 - **Byte accounting**: `remat` (bytes avoided on a hit) and `resident` (bytes
   the entry occupies).
@@ -69,7 +69,7 @@ while `resident_bytes > byte_capacity` (if byte budget is set).
 
 ### Staleness detection
 
-Signature-based: `(data_ptr, _version)` per source view. Detected automatically:
+Signature-based: `(data_ptr, _version, shape)` per source view. Detected automatically:
 
 | Operation | data_ptr | _version | Detected |
 |---|---|---|---|

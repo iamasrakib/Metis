@@ -15,6 +15,7 @@ A modern GPT-style decoder-only transformer with:
   • Flash Attention v2 via PyTorch SDPA
 """
 
+import logging
 import math
 import os
 
@@ -23,10 +24,11 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .attn import _repeat_kv as _repeat_kv_helper
 from .attn import causal_attention, set_backend_flags
-from .kv import KVCache, LayerKV  # KV cache subsystem (Phase 7)
+from .kv import KVCache, LayerKV, cached_len_of  # KV cache subsystem (Phase 7)
 from .moe import MoE  # grouped execution engine (token sorting / grouped GEMM)
+
+logger = logging.getLogger("metis.model")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Building Blocks
@@ -216,13 +218,6 @@ class CausalSelfAttention(nn.Module):
         if self.use_attention_sink:
             # Learnable sink token — appended to every sequence
             self.sink_token = nn.Parameter(torch.randn(1, 1, config.d_model) * 0.02)
-
-    def _repeat_kv(self, x: torch.Tensor, n_groups: int) -> torch.Tensor:
-        """Repeat KV heads to match query heads (GQA → MHA).
-
-        Delegates to :func:`metis.attn._repeat_kv` (single source of truth).
-        """
-        return _repeat_kv_helper(x, n_groups)
 
     # ── Checkpoint compatibility (fused QKV ↔ legacy split q/k/v) ────────────
     #
@@ -663,13 +658,19 @@ class MetisLM(nn.Module):
                 f"not match input length {T}"
             )
 
-        # Embeddings
+        # Embeddings. With RoPE disabled, the position embedding must reflect
+        # the token's ABSOLUTE position — during warm decode that is the cached
+        # prefix length (``cached_len + i``), not a fresh 0..T-1 each call
+        # (which would embed every generated token at position 0 and corrupt
+        # long generations). ``cached_len_of`` returns 0 for cold starts and
+        # training, so the common paths are unchanged.
         x = self.tok_emb(idx)
         if not self.config.use_rope:
             if position_ids is not None:
                 pos = position_ids
             else:
-                pos = torch.arange(0, T, dtype=torch.long, device=device)
+                base = cached_len_of(kv_cache)
+                pos = base + torch.arange(0, T, dtype=torch.long, device=device)
             x = x + self.pos_emb(pos)
         x = self.drop(x)
 
@@ -724,7 +725,7 @@ class MetisLM(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=0,
+                ignore_index=self.config.pad_id,
             )
         else:
             logits = self.lm_head(x[:, [-1], :])
@@ -739,8 +740,15 @@ class MetisLM(nn.Module):
         weight_decay: float,
         learning_rate: float,
         device_type: str,
+        optimizer: str = "adamw",
     ) -> torch.optim.Optimizer:
-        """Configure AdamW optimizer with weight decay separation."""
+        """Configure an AdamW-family optimizer with weight decay separation.
+
+        ``optimizer="bnb8bit"`` uses bitsandbytes' 8-bit AdamW, which stores the
+        optimizer states in int8 — required to fit ~1B-param models in 16 GB of
+        VRAM. It needs CUDA and bitsandbytes; either missing → falls back to
+        plain AdamW with a warning.
+        """
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
@@ -749,6 +757,28 @@ class MetisLM(nn.Module):
             {"params": decay_params, "weight_decay": weight_decay},
             {"params": nodecay_params, "weight_decay": 0.0},
         ]
+
+        if optimizer == "bnb8bit":
+            if not device_type.startswith("cuda"):
+                logger.warning("bnb8bit requires CUDA — falling back to AdamW")
+                optimizer = "adamw"
+            else:
+                try:
+                    import bitsandbytes as bnb
+                except ImportError:
+                    logger.warning(
+                        "bitsandbytes is not installed — falling back to AdamW. "
+                        "Install it (`pip install bitsandbytes`) to fit ~1B-param "
+                        "models in 16 GB of VRAM."
+                    )
+                    optimizer = "adamw"
+                else:
+                    return bnb.optim.AdamW8bit(
+                        optim_groups,
+                        lr=learning_rate,
+                        betas=(0.9, 0.95),
+                        eps=1e-8,
+                    )
 
         fused_available = "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
         use_fused = fused_available and device_type.startswith("cuda")

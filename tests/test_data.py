@@ -4,25 +4,24 @@
 
 import os
 import sys
-import json
 import tempfile
+
+import numpy as np
 import pytest
 import torch
-import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from metis.data import (
     BPETokenizer,
     CharTokenizer,
-    TextDataset,
     MMapDataset,
-    load_text,
-    train_val_split,
+    TextDataset,
     create_dataloader,
+    load_text,
     tokenize_and_cache,
+    train_val_split,
 )
-
 
 # ── BPETokenizer Tests ───────────────────────────────────────────────────────
 
@@ -57,10 +56,35 @@ class TestBPETokenizer:
         assert ids[-1] == tok.eos_id
         decoded = tok.decode(ids, skip_special=True)
         assert decoded == "abc"
+        # skip_special=False keeps the special tokens in the decoded string.
         decoded_with_special = tok.decode(ids, skip_special=False)
-        assert tok.bos_id in [ord(c) for c in decoded_with_special] or \
-               any(ord(c) > 127 for c in decoded_with_special) or \
-               True  # special tokens are non-printable in char mode
+        assert "<bos>" in decoded_with_special
+        assert "<eos>" in decoded_with_special
+
+    def test_bpe_special_ids_do_not_collide_with_native_vocab(self):
+        """Specials are registered ABOVE the native tiktoken vocab (regression).
+
+        In cl100k_base, native id 0 is ``'!'`` — if ``<pad>`` & co. reused ids
+        0-3 (the original bug), padding and decode would silently alias real
+        tokens. Verify every special id is disjoint from the native ranks and
+        that a real BPE round-trip still works.
+        """
+        import tiktoken
+
+        tok = BPETokenizer(encoding_name="gpt2")
+        assert tok.is_bpe
+        base = tiktoken.get_encoding("gpt2")
+        native = set(base._mergeable_ranks.values()) | set(base._special_tokens.values())
+        special_ids = {tok.pad_id, tok.unk_id, tok.bos_id, tok.eos_id}
+        assert special_ids.isdisjoint(native)
+        assert len(special_ids) == 4  # and distinct from each other
+        # A native token whose id would have fallen in the old 0-3 slot is not
+        # shadowed by any special token.
+        assert tok.encode("!")[0] not in special_ids
+        assert tok.decode(tok.encode("hello world")) == "hello world"
+        # add_bos/add_eos still bracket with the remapped (high) ids.
+        ids = tok.encode("hi", add_bos=True, add_eos=True)
+        assert ids[0] == tok.bos_id and ids[-1] == tok.eos_id
 
     def test_vocab_properties(self):
         tok = BPETokenizer(encoding_name="char")
@@ -224,6 +248,20 @@ class TestCreateDataloader:
         assert x.shape == (4, 16)
         assert y.shape == (4, 16)
 
+    def test_ddp_ranks_shard_disjoint(self):
+        """DDP ranks must iterate disjoint slices (no duplicated training data)."""
+        tok = CharTokenizer()
+        tok.fit("hello world this is a test " * 100)
+        text = "hello world this is a test " * 100
+        r0 = create_dataloader(text, tok, seq_len=16, batch_size=4,
+                               use_mmap=False, rank=0, world_size=2)
+        r1 = create_dataloader(text, tok, seq_len=16, batch_size=4,
+                               use_mmap=False, rank=1, world_size=2)
+        r0_ids = {tuple(b[0].flatten().tolist()) for b in r0}
+        r1_ids = {tuple(b[0].flatten().tolist()) for b in r1}
+        assert r0_ids and r1_ids
+        assert r0_ids.isdisjoint(r1_ids)
+
 
 # ── Tokenization Cache ───────────────────────────────────────────────────────
 
@@ -232,17 +270,44 @@ class TestTokenizeAndCache:
         tok = BPETokenizer(encoding_name="char")
         tok.fit("hello world " * 100)
         text = "hello world " * 100
-        # Use a unique path for cache
-        unique_path = f"/tmp/_test_cache_{id(text)}.txt"
-        try:
-            data, cache_path = tokenize_and_cache(text, tok, seq_len=16,
-                                                   dataset_path=unique_path)
-            assert len(data) > 0
-            assert os.path.exists(cache_path)
-            # Load from cache
-            data2, _ = tokenize_and_cache(text, tok, seq_len=16,
+        unique_path = os.path.join(tempfile.mkdtemp(), f"_test_cache_{id(text)}.txt")
+        data, cache_path = tokenize_and_cache(text, tok, seq_len=16,
+                                              dataset_path=unique_path)
+        assert len(data) > 0
+        assert os.path.exists(cache_path)
+        # A second call must load from the on-disk cache, not re-tokenize.
+        data2, _ = tokenize_and_cache(text, tok, seq_len=16,
+                                      dataset_path=unique_path)
+        assert np.array_equal(data, data2)
+        del data2  # release the memmap file handle (Windows locks the file)
+        os.unlink(cache_path)
+
+    def test_create_dataloader_drops_corrupt_cache(self):
+        """A corrupt .npy cache is deleted and rebuilt, not loaded silently.
+
+        Regression test for the fallback that catches (OSError, ValueError,
+        EOFError) from the mmap cache path and removes the unusable file.
+        """
+        tok = BPETokenizer(encoding_name="char")
+        tok.fit("hello world " * 100)
+        text = "hello world " * 100
+        unique_path = os.path.join(tempfile.mkdtemp(), "_test_corrupt.txt")
+
+        # Prime a valid cache, then corrupt the file on disk.
+        _, cache_path = tokenize_and_cache(text, tok, seq_len=16,
                                            dataset_path=unique_path)
-            assert np.array_equal(data, data2)
-            os.unlink(cache_path)
-        except Exception:
-            pass  # cache dir issues in test env
+        assert os.path.exists(cache_path)
+        with open(cache_path, "wb") as f:
+            f.write(b"\x00corrupt-npy-header" * 8)
+        assert os.path.exists(cache_path)
+
+        # Loading must fall back to in-memory tokenization AND drop the file.
+        loader = create_dataloader(
+            text, tok, seq_len=16, batch_size=2,
+            dataset_path=unique_path, use_mmap=True,
+        )
+        assert not os.path.exists(cache_path)
+        batches = list(loader)
+        assert len(batches) > 0
+        x, y = batches[0]
+        assert x.shape[0] == 2 and x.shape[1] == 16
