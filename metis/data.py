@@ -663,7 +663,42 @@ def _cache_path(dataset_path: str, tokenizer_name: str, seq_len: int,
     base = os.path.splitext(os.path.basename(dataset_path))[0]
     cache_dir = os.path.join("cache", "tokenized")
     os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, f"{base}_{tokenizer_name}_{raw_hash}_sl{seq_len}.npy")
+    return os.path.join(cache_dir, f"{base}_{tokenizer_name}_{raw_hash}_sl{seq_len}_v2.npy")
+
+
+_CHUNK_CHARS = 64_000_000  # ~16M tokens per chunk — keeps transient lists small
+
+
+def _tokenize_large(tokenizer: BPETokenizer, text: str) -> np.ndarray:
+    """Encode a large corpus in chunks, returning a compact numpy array.
+
+    ``BPETokenizer.encode`` returns a Python list of one int per token
+    (~28 bytes per int object on 64-bit CPython).  On a multi-hundred-million-
+    token corpus that list alone is many GB and OOMs Colab's ~12 GB RAM
+    (the 500M-token FineWeb-Edu corpus → ~14 GB).  Chunking keeps each
+    transient list to ~16M tokens (~0.5 GB); chunk boundaries fall on
+    newlines so BPE tokens never straddle an edge.
+    """
+    arrays: list[np.ndarray] = []
+    max_id = 0
+    n = len(text)
+    start = 0
+    while start < n:
+        end = min(start + _CHUNK_CHARS, n)
+        if end < n:  # not the final chunk — break on a newline for a clean edge
+            nl = text.rfind("\n", start, end)
+            if nl > start:
+                end = nl + 1
+        ids = tokenizer.encode(text[start:end])
+        if ids:
+            max_id = max(max_id, max(ids))
+            arrays.append(np.array(ids, dtype=np.uint32))
+        start = end
+    dtype = np.uint32 if max_id > 65535 else np.uint16
+    if not arrays:
+        return np.array([], dtype=dtype)
+    data = np.concatenate(arrays)
+    return data if dtype == np.uint32 else data.astype(dtype)
 
 
 def tokenize_and_cache(
@@ -690,18 +725,15 @@ def tokenize_and_cache(
         return data, cache_path
 
     logger.info(f"Tokenizing {len(text):,} chars...")
-    ids = tokenizer.encode(text)
-    max_id = max(ids) if ids else 0
-    if max_id > 65535:
-        dtype = np.uint32
-        logger.info(f"  Max token id {max_id} > uint16 — using uint32")
-    else:
-        dtype = np.uint16
-    data = np.array(ids, dtype=dtype)
+    # Chunked encoding: encode() on the full corpus materializes a Python list
+    # of one int per token (~28 bytes each) — a multi-hundred-million-token
+    # corpus becomes ~14 GB and OOMs Colab's ~12 GB RAM. _tokenize_large keeps
+    # each transient list to a ~16M-token chunk and returns a compact array.
+    data = _tokenize_large(tokenizer, text)
     np.save(cache_path, data)
     logger.info(
         f"Tokenized cache saved: {cache_path} "
-        f"({len(data):,} tokens, dtype={dtype.__name__})"
+        f"({len(data):,} tokens, dtype={data.dtype.name})"
     )
     return data, cache_path
 
@@ -1005,9 +1037,10 @@ def create_dataloader(
                 num_workers=num_workers, rank=rank, world_size=world_size,
             )
 
-    # Fallback: in-memory dataset
-    encoded = tokenizer.encode(text)
-    data_tensor = torch.tensor(encoded, dtype=torch.long)
+    # Fallback: in-memory dataset (chunked encode — same RAM safety as the
+    # mmap path, so --no-mmap on a large corpus can't OOM either).
+    data = _tokenize_large(tokenizer, text)
+    data_tensor = torch.tensor(data, dtype=torch.long)
     dataset = TextDataset(data_tensor, seq_len)
     return _make_loader(
         dataset, batch_size, shuffle, drop_last=True,
