@@ -17,6 +17,7 @@ Professional training with:
   • Reproducible seeding
 """
 
+import gc
 import logging
 import math
 import os
@@ -604,6 +605,13 @@ def train(config: ModelConfig, resume: bool = False) -> None:
             dataset_path=config.dataset_path,
             rank=ddp_rank, world_size=ddp_world_size,
         )
+
+    # The raw corpus strings were only needed to tokenize — the loaders now
+    # hold compact token arrays. Free them before building the model: a 2 GB
+    # corpus kept alive as text + slices (~4 GB) plus the fp32 model pushes a
+    # Colab free-tier T4 runtime over its ~12 GB RAM budget.
+    del text, train_text, val_text
+    gc.collect()
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = MetisLM(config)
