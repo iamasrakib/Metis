@@ -701,6 +701,67 @@ def _tokenize_large(tokenizer: BPETokenizer, text: str) -> np.ndarray:
     return data if dtype == np.uint32 else data.astype(dtype)
 
 
+def _file_fingerprint(path: str) -> str:
+    """Content fingerprint for cache invalidation, without reading the file whole.
+
+    The in-memory variant (:func:`_content_fingerprint`) hashes a loaded str;
+    this hashes a file's size plus head/tail bytes so a multi-GB corpus is
+    never read into RAM just to build a cache key.
+    """
+    size = os.path.getsize(path)
+    h = hashlib.sha256()
+    h.update(str(size).encode("utf-8"))
+    with open(path, "rb") as f:
+        h.update(f.read(65_536))
+        f.seek(max(0, size - 65_536))
+        h.update(f.read())
+    return h.hexdigest()[:12]
+
+
+def _tokenize_file_streaming(path: str, tokenizer: BPETokenizer) -> np.ndarray:
+    """Encode a large corpus file in newline-aligned chunks, never loading it whole.
+
+    Loading a multi-GB corpus as one ``str`` is itself the OOM: a 2 GB file
+    becomes 4-8 GB in RAM (CPython pads a string to 2/4 bytes per char once any
+    char exceeds ASCII, and web text is full of unicode), and train/val slicing
+    makes copies of that. Reading the file in 64M-char windows keeps peak RAM to
+    the compact token array (~2 GB per 500M tokens) plus one window; boundaries
+    land on newlines so BPE tokens stay clean across edges.
+    """
+    arrays: list[np.ndarray] = []
+    max_id = 0
+    carry = ""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        while True:
+            chunk = f.read(_CHUNK_CHARS)
+            window = carry + chunk
+            if not window:
+                break
+            eof = not chunk
+            if not eof and "\n" not in window:
+                # No newline in the window — hold it over for more data, but cap
+                # carry so a pathological newline-free run stays bounded.
+                carry = window
+                if len(carry) >= 4 * _CHUNK_CHARS:
+                    carry, piece = carry[_CHUNK_CHARS:], carry[:_CHUNK_CHARS]
+                    ids = tokenizer.encode(piece)
+                    if ids:
+                        max_id = max(max_id, max(ids))
+                        arrays.append(np.array(ids, dtype=np.uint32))
+                continue
+            cut = (window.rfind("\n") + 1) if not eof else len(window)
+            piece, carry = window[:cut], window[cut:]
+            ids = tokenizer.encode(piece)
+            if ids:
+                max_id = max(max_id, max(ids))
+                arrays.append(np.array(ids, dtype=np.uint32))
+    dtype = np.uint32 if max_id > 65535 else np.uint16
+    if not arrays:
+        return np.array([], dtype=dtype)
+    data = np.concatenate(arrays)
+    return data if dtype == np.uint32 else data.astype(dtype)
+
+
 def tokenize_and_cache(
     text: str,
     tokenizer: BPETokenizer,
@@ -1046,6 +1107,65 @@ def create_dataloader(
         dataset, batch_size, shuffle, drop_last=True,
         num_workers=num_workers, rank=rank, world_size=world_size,
     )
+
+
+def create_dataloaders_from_file(
+    dataset_path: str,
+    tokenizer: BPETokenizer,
+    seq_len: int,
+    batch_size: int,
+    train_ratio: float = 0.9,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    force_recache: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+) -> tuple[DataLoader, DataLoader]:
+    """Build train/val DataLoaders by stream-tokenizing a corpus file.
+
+    The memory-safe counterpart of :func:`create_dataloader` for large
+    single-file corpora: the file is encoded in newline-aligned chunks straight
+    from disk (:func:`_tokenize_file_streaming`), so the full corpus is never
+    held as a Python ``str``. The tokenized array is cached on disk keyed by a
+    file fingerprint, so resume runs load it without re-encoding; the array is
+    split at ``train_ratio`` for train/val (both are views — no copies).
+
+    Returns:
+        Tuple of (train_loader, val_loader).
+    """
+    cache_path = _cache_path(
+        dataset_path, _tokenizer_cache_name(tokenizer), seq_len,
+        _file_fingerprint(dataset_path),
+    )
+    if not force_recache and os.path.exists(cache_path):
+        logger.info(f"Loading tokenized cache: {cache_path}")
+        data = np.load(cache_path, mmap_mode="r")
+    else:
+        logger.info(
+            f"Tokenizing {os.path.getsize(dataset_path):,} bytes "
+            f"(streamed — corpus never loaded whole)..."
+        )
+        data = _tokenize_file_streaming(dataset_path, tokenizer)
+        np.save(cache_path, data)
+        logger.info(
+            f"Tokenized cache saved: {cache_path} "
+            f"({len(data):,} tokens, dtype={data.dtype.name})"
+        )
+    split = int(len(data) * train_ratio)
+    if split < seq_len + 1 or len(data) - split < seq_len + 1:
+        raise ValueError(
+            f"Corpus tokenizes to {len(data)} tokens, too small to split into "
+            f"train/val sequences of length {seq_len}. Provide more data."
+        )
+    train_loader = _make_loader(
+        MMapDataset(data[:split], seq_len), batch_size, shuffle,
+        drop_last=True, num_workers=num_workers, rank=rank, world_size=world_size,
+    )
+    val_loader = _make_loader(
+        MMapDataset(data[split:], seq_len), batch_size, shuffle=False,
+        drop_last=True, num_workers=num_workers, rank=rank, world_size=world_size,
+    )
+    return train_loader, val_loader
 
 
 # Backward compatibility aliases

@@ -311,3 +311,65 @@ class TestTokenizeAndCache:
         assert len(batches) > 0
         x, y = batches[0]
         assert x.shape[0] == 2 and x.shape[1] == 16
+
+
+# ── Streaming tokenization (large-corpus RAM safety) ─────────────────────────
+
+class TestStreamingTokenizer:
+    def test_streamed_matches_in_memory(self, tmp_path):
+        """Streaming from disk must equal in-memory chunked tokenization.
+
+        Regression guard for the Colab RAM OOM: a large corpus is never loaded
+        as one str, but the tokens produced must be identical to the in-memory
+        path so training sees the same data.
+        """
+        from metis import data as d
+
+        corpus = "\n".join(
+            f"doc {i}: quick brown fox — café 日本語 😀 €500" for i in range(300)
+        )
+        p = tmp_path / "corpus.txt"
+        p.write_text(corpus, encoding="utf-8")
+        tok = BPETokenizer(encoding_name="cl100k_base")
+        tok.fit(corpus)
+        d._CHUNK_CHARS = 64  # force many small windows in both paths
+        try:
+            ref = d._tokenize_large(tok, corpus)
+            got = d._tokenize_file_streaming(str(p), tok)
+        finally:
+            d._CHUNK_CHARS = 64_000_000
+        assert got.tolist() == ref.tolist()
+
+    def test_streamed_no_newlines_is_bounded(self, tmp_path):
+        """A newline-free file must still tokenize without an unbounded carry."""
+        from metis import data as d
+
+        p = tmp_path / "nodata.txt"
+        p.write_text("hello world 🚀 " * 50000, encoding="utf-8")
+        tok = BPETokenizer(encoding_name="cl100k_base")
+        tok.fit("hello world 🚀")
+        d._CHUNK_CHARS = 64
+        try:
+            got = d._tokenize_file_streaming(str(p), tok)
+        finally:
+            d._CHUNK_CHARS = 64_000_000
+        assert len(got) > 0
+
+    def test_create_dataloaders_from_file(self, tmp_path):
+        """Builds train/val loaders over the streamed token array."""
+        from metis.data import MMapDataset, create_dataloaders_from_file
+
+        corpus = "\n".join(
+            f"sentence {i}: the quick brown fox jumps over the lazy dog"
+            for i in range(500)
+        )
+        p = tmp_path / "corpus.txt"
+        p.write_text(corpus, encoding="utf-8")
+        tok = BPETokenizer(encoding_name="cl100k_base")
+        tok.fit(corpus)
+        tr, va = create_dataloaders_from_file(
+            str(p), tok, seq_len=16, batch_size=4, train_ratio=0.8,
+        )
+        assert isinstance(tr.dataset, MMapDataset)
+        assert isinstance(va.dataset, MMapDataset)
+        assert len(tr.dataset) > 0 and len(va.dataset) > 0

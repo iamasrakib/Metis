@@ -32,6 +32,7 @@ from .data import (
     BPETokenizer,
     CharTokenizer,
     create_dataloader,
+    create_dataloaders_from_file,
     create_packed_dataloader,
     load_documents,
     load_text,
@@ -535,12 +536,25 @@ def train(config: ModelConfig, resume: bool = False) -> None:
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     # ── Data ──────────────────────────────────────────────────────────────
-    try:
-        text = load_text(config.dataset_path)
-    except FileNotFoundError as e:
-        logger.error(str(e))
-        logger.error("  Provide a dataset: metis train --dataset data/input.txt")
-        raise
+    # Large single-file BPE corpora are stream-tokenized straight from disk so
+    # the corpus is never held as one Python str: a 2 GB file becomes 4-8 GB in
+    # RAM (CPython pads a str to 2/4 bytes per char once any char is non-ASCII)
+    # and the train/val slice copies would double that — together enough to OOM
+    # a Colab free-tier T4 before training even starts.
+    use_streaming = (
+        config.use_mmap and not config.use_packing
+        and os.path.isfile(config.dataset_path)
+        and config.tokenizer != "char"
+    )
+    if use_streaming:
+        text = None
+    else:
+        try:
+            text = load_text(config.dataset_path)
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            logger.error("  Provide a dataset: metis train --dataset data/input.txt")
+            raise
 
     # ── Tokenizer ─────────────────────────────────────────────────────────
     if config.tokenizer == "char":
@@ -548,7 +562,8 @@ def train(config: ModelConfig, resume: bool = False) -> None:
     else:
         tokenizer = BPETokenizer(encoding_name=config.tokenizer)
 
-    tokenizer.fit(text)
+    if not use_streaming:
+        tokenizer.fit(text)  # char mode builds its vocab from the full corpus
     tokenizer_path = os.path.join(config.checkpoint_dir, "tokenizer.json")
     if is_main_process():
         tokenizer.save(tokenizer_path)
@@ -556,7 +571,10 @@ def train(config: ModelConfig, resume: bool = False) -> None:
     config.pad_id = tokenizer.pad_id
 
     # ── Data Splits ───────────────────────────────────────────────────────
-    train_text, val_text = train_val_split(text, config.train_split)
+    if use_streaming:
+        train_text = val_text = None  # split happens on the token array instead
+    else:
+        train_text, val_text = train_val_split(text, config.train_split)
 
     # Adjust batch size for DDP (global batch = micro_batch * world_size)
     micro_batch = config.micro_batch_size
@@ -590,26 +608,34 @@ def train(config: ModelConfig, resume: bool = False) -> None:
             strategy=config.packing_strategy, shuffle=False, seed=config.seed,
         )
     else:
-        train_loader = create_dataloader(
-            train_text, tokenizer, config.max_seq_len, micro_batch,
-            shuffle=True, use_mmap=config.use_mmap,
-            num_workers=config.num_workers,
-            dataset_path=config.dataset_path,
-            force_recache=config.force_recache,
-            rank=ddp_rank, world_size=ddp_world_size,
-        )
-        val_loader = create_dataloader(
-            val_text, tokenizer, config.max_seq_len, micro_batch,
-            shuffle=False, use_mmap=config.use_mmap,
-            num_workers=config.num_workers,
-            dataset_path=config.dataset_path,
-            rank=ddp_rank, world_size=ddp_world_size,
-        )
+        if use_streaming:
+            train_loader, val_loader = create_dataloaders_from_file(
+                config.dataset_path, tokenizer, config.max_seq_len, micro_batch,
+                train_ratio=config.train_split, shuffle=True,
+                num_workers=config.num_workers,
+                force_recache=config.force_recache,
+                rank=ddp_rank, world_size=ddp_world_size,
+            )
+        else:
+            train_loader = create_dataloader(
+                train_text, tokenizer, config.max_seq_len, micro_batch,
+                shuffle=True, use_mmap=config.use_mmap,
+                num_workers=config.num_workers,
+                dataset_path=config.dataset_path,
+                force_recache=config.force_recache,
+                rank=ddp_rank, world_size=ddp_world_size,
+            )
+            val_loader = create_dataloader(
+                val_text, tokenizer, config.max_seq_len, micro_batch,
+                shuffle=False, use_mmap=config.use_mmap,
+                num_workers=config.num_workers,
+                dataset_path=config.dataset_path,
+                rank=ddp_rank, world_size=ddp_world_size,
+            )
 
     # The raw corpus strings were only needed to tokenize — the loaders now
-    # hold compact token arrays. Free them before building the model: a 2 GB
-    # corpus kept alive as text + slices (~4 GB) plus the fp32 model pushes a
-    # Colab free-tier T4 runtime over its ~12 GB RAM budget.
+    # hold compact token arrays. Free them before building the model (in
+    # streaming mode they are already None: the corpus was never loaded).
     del text, train_text, val_text
     gc.collect()
 
