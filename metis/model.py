@@ -735,8 +735,10 @@ class MetisLM(nn.Module):
         if targets is not None:
             V = self.lm_head.weight.size(0)
             # Memory-efficient cross-entropy: materializing the full (B*T, vocab)
-            # logits for a 100k-vocab model is ~8 GB in fp16 (autocast then casts
-            # them to fp32 for the softmax → ~16 GB) — that alone OOMs a 16 GB
+            # logits for a 100k-vocab model is ~0.8 GB in fp16 (autocast then casts
+            # them to fp32 for the softmax → ~1.6 GB), and the softmax's fp32
+            # temporaries multiply that several-fold — on top of an 805M model
+            # (fp32 weights + grads + bnb 8-bit states ≈ 8 GB) that OOMs a 16 GB
             # GPU on the first training step. When the full logits would be large
             # (≥ _CE_CHUNK_MIN_BYTES fp32), apply lm_head + CE in chunks over T:
             # identical loss (sum over non-padded tokens / their count) with a
