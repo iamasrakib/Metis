@@ -1149,15 +1149,32 @@ def create_dataloaders_from_file(
         _file_fingerprint(dataset_path),
     )
     if not force_recache and os.path.exists(cache_path):
-        logger.info(f"Loading tokenized cache: {cache_path}")
-        data = np.load(cache_path, mmap_mode="r")
+        try:
+            logger.info(f"Loading tokenized cache: {cache_path}")
+            data = np.load(cache_path, mmap_mode="r")
+        except (OSError, ValueError, EOFError) as e:
+            # A cache truncated by a killed run (e.g. Colab SIGKILL mid-save)
+            # is unusable — drop it and rebuild fresh rather than crash.
+            logger.warning(f"Unusable cache ({e}); deleting and re-tokenizing")
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+            data = None
     else:
+        data = None
+    if data is None:
         logger.info(
             f"Tokenizing {os.path.getsize(dataset_path):,} bytes "
             f"(streamed — corpus never loaded whole)..."
         )
         data = _tokenize_file_streaming(dataset_path, tokenizer)
-        np.save(cache_path, data)
+        # Save via a temp file then atomic rename, so a kill mid-save never
+        # leaves a partial cache that poisons the next run. (np.save appends
+        # .npy itself, so the temp name must already end in .npy.)
+        tmp_path = cache_path + ".tmp.npy"
+        np.save(tmp_path, data)
+        os.replace(tmp_path, cache_path)
         logger.info(
             f"Tokenized cache saved: {cache_path} "
             f"({len(data):,} tokens, dtype={data.dtype.name})"

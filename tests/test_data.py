@@ -373,3 +373,37 @@ class TestStreamingTokenizer:
         assert isinstance(tr.dataset, MMapDataset)
         assert isinstance(va.dataset, MMapDataset)
         assert len(tr.dataset) > 0 and len(va.dataset) > 0
+
+    def test_streaming_cache_recovers_from_corruption(self, tmp_path):
+        """A cache truncated by a killed run is deleted and rebuilt, not fatal.
+
+        Regression guard for Colab SIGKILL landing mid-save: the partial .npy
+        must not crash the next run — it is dropped and re-tokenized.
+        """
+        from metis.data import create_dataloaders_from_file
+
+        corpus = "\n".join(
+            f"line {i}: the quick brown fox jumps over the lazy dog"
+            for i in range(200)
+        )
+        p = tmp_path / "corpus.txt"
+        p.write_text(corpus, encoding="utf-8")
+        tok = BPETokenizer(encoding_name="cl100k_base")
+        tok.fit(corpus)
+
+        tr, va = create_dataloaders_from_file(
+            str(p), tok, seq_len=8, batch_size=4, train_ratio=0.8,
+        )
+        assert len(tr.dataset) > 0
+
+        # Corrupt every cache file this dataset produced, then reload.
+        from metis.data import _cache_path, _file_fingerprint, _tokenizer_cache_name
+        cache_path = _cache_path(
+            str(p), _tokenizer_cache_name(tok), 8, _file_fingerprint(str(p)),
+        )
+        with open(cache_path, "wb") as f:
+            f.write(b"\x00partial" * 4)
+        tr2, va2 = create_dataloaders_from_file(
+            str(p), tok, seq_len=8, batch_size=4, train_ratio=0.8,
+        )
+        assert len(tr2.dataset) > 0  # rebuilt, not crashed
