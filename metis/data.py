@@ -731,6 +731,23 @@ def _tokenize_file_streaming(path: str, tokenizer: BPETokenizer) -> np.ndarray:
     arrays: list[np.ndarray] = []
     max_id = 0
     carry = ""
+    total_bytes = os.path.getsize(path)
+    next_mark = 0.1
+
+    def _emit(piece: str) -> None:
+        """Encode one window and log coarse progress so a long run isn't silent."""
+        nonlocal max_id, next_mark
+        ids = tokenizer.encode(piece)
+        if ids:
+            max_id = max(max_id, max(ids))
+            arrays.append(np.array(ids, dtype=np.uint32))
+        pct = f.tell() / total_bytes if total_bytes else 1.0
+        if pct >= next_mark:
+            logger.info(
+                f"  {pct * 100:3.0f}% tokenized ({f.tell() / 1e6:,.0f} MB read)"
+            )
+            next_mark += 0.1
+
     with open(path, encoding="utf-8", errors="replace") as f:
         while True:
             chunk = f.read(_CHUNK_CHARS)
@@ -744,17 +761,11 @@ def _tokenize_file_streaming(path: str, tokenizer: BPETokenizer) -> np.ndarray:
                 carry = window
                 if len(carry) >= 4 * _CHUNK_CHARS:
                     carry, piece = carry[_CHUNK_CHARS:], carry[:_CHUNK_CHARS]
-                    ids = tokenizer.encode(piece)
-                    if ids:
-                        max_id = max(max_id, max(ids))
-                        arrays.append(np.array(ids, dtype=np.uint32))
+                    _emit(piece)
                 continue
             cut = (window.rfind("\n") + 1) if not eof else len(window)
             piece, carry = window[:cut], window[cut:]
-            ids = tokenizer.encode(piece)
-            if ids:
-                max_id = max(max_id, max(ids))
-                arrays.append(np.array(ids, dtype=np.uint32))
+            _emit(piece)
     dtype = np.uint32 if max_id > 65535 else np.uint16
     if not arrays:
         return np.array([], dtype=dtype)
