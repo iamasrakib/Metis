@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import subprocess
+import threading
 import time
 
 import torch
@@ -485,6 +486,48 @@ def _log_wandb(metrics: dict, step: int) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Memory watchdog
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _start_memory_watchdog(interval: float = 15.0) -> threading.Event:
+    """Start a daemon that logs VRAM + system RAM every ``interval`` seconds.
+
+    Colab's free T4 kills the kernel with *no traceback* when it OOMs, so the
+    crash is invisible in the logs. This watchdog writes its own cause: if the
+    kernel dies shortly after the last ``memwatch`` line, that line shows how
+    much headroom remained. Returns a stop Event (daemon dies with the process
+    anyway; the Event just stops the thread cleanly).
+    """
+    stop = threading.Event()
+
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+
+    def _log() -> None:
+        gpu = ""
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1e9
+            res = torch.cuda.memory_reserved() / 1e9
+            gpu = f"gpu_alloc {alloc:.2f}GB (resv {res:.2f}GB)"
+        ram = ""
+        if psutil is not None:
+            vm = psutil.virtual_memory()
+            ram = f"ram {vm.used/1e9:.1f}/{vm.total/1e9:.1f}GB"
+        logger.info(f"memwatch: {gpu} | {ram}".strip(" |"))
+
+    def _run() -> None:
+        _log()
+        while not stop.wait(interval):
+            _log()
+
+    t = threading.Thread(target=_run, name="memwatch", daemon=True)
+    t.start()
+    return stop
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Training Loop
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -827,6 +870,14 @@ def train(config: ModelConfig, resume: bool = False) -> None:
             # overlaps its transfer with the first forward.
             stager.stage(cur_batches[0])
 
+    # Memory watchdog: logs VRAM + system RAM every ~15 s so a Colab kernel
+    # death (which raises no traceback) leaves its cause in the logs.
+    memwatch_stop = (
+        _start_memory_watchdog()
+        if torch.cuda.is_available() and is_main_process()
+        else None
+    )
+
     try:
         for step in pbar:
                 # Update learning rate
@@ -1074,6 +1125,8 @@ def train(config: ModelConfig, resume: bool = False) -> None:
                 raw_model, optimizer, config, step, best_val_loss,
                 ckpt_path, ema=ema,
             )
+        if memwatch_stop is not None:
+            memwatch_stop.set()
         raise
     # ── Final Save ────────────────────────────────────────────────────────
     total_time = time.time() - t0
@@ -1137,6 +1190,8 @@ def train(config: ModelConfig, resume: bool = False) -> None:
         )
 
     # Shut down the pipeline threads (flush any in-flight async checkpoint).
+    if memwatch_stop is not None:
+        memwatch_stop.set()
     if checkpointer is not None:
         checkpointer.close()
     if prefetcher is not None:
