@@ -173,9 +173,50 @@ class TestMetisLM:
         model = MetisLM(config)
         idx = torch.randint(0, config.vocab_size, (2, 16))
         logits, loss, cache = model(idx, targets=idx)
+        # Small vocab → the full (B, T, V) logits are still returned.
         assert logits.shape == (2, 16, config.vocab_size)
         assert loss is not None
         assert loss.item() > 0  # Random init should have non-zero loss
+
+    def test_chunked_loss_matches_full_reference(self):
+        """Chunked (memory-efficient) CE must equal the full-tensor CE loss.
+
+        Regression guard for the 16 GB-GPU OOM: a large-vocab model computes the
+        loss in chunks over T so the multi-GB (B*T, V) logits are never built.
+        Forcing the chunked path with tiny chunks must reproduce the original
+        full-tensor loss exactly.
+        """
+        import torch.nn.functional as F
+
+        import metis.model as m
+
+        config = make_config(d_model=64, n_layers=2, max_seq_len=32)
+        model = MetisLM(config)
+        torch.manual_seed(0)
+        idx = torch.randint(0, config.vocab_size, (2, 32))
+        targets = idx.clone()
+
+        # Reference: the original path — full forward, full logits, mean CE.
+        with torch.no_grad():
+            x = model.tok_emb(idx)
+            for layer in model.layers:
+                x, _ = layer(x, kv_cache=None, attention_mask=None,
+                             position_ids=None)
+            x = model.norm_f(x)
+            logits = model.lm_head(x)
+            ref = F.cross_entropy(
+                logits.view(-1, config.vocab_size), targets.view(-1),
+                ignore_index=config.pad_id,
+            ).item()
+
+        m._CE_CHUNK_MIN_BYTES = 0      # force the chunked path
+        m._CE_CHUNK_ELEMS = 32         # force chunk_T = 1 (32 separate chunks)
+        try:
+            _, loss, _ = model(idx, targets=targets)
+        finally:
+            m._CE_CHUNK_MIN_BYTES = 256 * 1024 * 1024
+            m._CE_CHUNK_ELEMS = 32_000_000
+        assert loss.item() == pytest.approx(ref, rel=1e-5)
 
     def test_loss_decreases(self):
         """Overfitting test: model should memorize a tiny sequence."""

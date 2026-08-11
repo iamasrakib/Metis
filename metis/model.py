@@ -28,6 +28,14 @@ from .attn import causal_attention, set_backend_flags
 from .kv import KVCache, LayerKV, cached_len_of  # KV cache subsystem (Phase 7)
 from .moe import MoE  # grouped execution engine (token sorting / grouped GEMM)
 
+# Chunk the training cross-entropy whenever the full (B*T, vocab) logits would
+# exceed this (fp32) byte footprint, so a 100k-vocab model never materializes a
+# multi-GB logits tensor on a 16 GB GPU. Small models stay on the original path
+# (which also returns the full ``logits`` tensor).
+_CE_CHUNK_MIN_BYTES = 256 * 1024 * 1024
+# Cap each loss chunk's logits at ~32M elements (~64 MB fp16 / 128 MB fp32).
+_CE_CHUNK_ELEMS = 32_000_000
+
 logger = logging.getLogger("metis.model")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -642,7 +650,11 @@ class MetisLM(nn.Module):
                 starts at position 0.
 
         Returns:
-            Tuple of (logits, loss, new_kv_cache).
+            Tuple of (logits, loss, new_kv_cache). With ``targets`` given, a
+            large model computes the loss via a memory-efficient chunked
+            cross-entropy and ``logits`` is ``None`` (the full (B, T, V) tensor
+            is never built); for small models ``logits`` is the full tensor.
+            With ``targets=None`` ``logits`` covers just the final position.
         """
         B, T = idx.size()
         device = idx.device
@@ -721,12 +733,40 @@ class MetisLM(nn.Module):
         x = self.norm_f(x)
 
         if targets is not None:
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=self.config.pad_id,
-            )
+            V = self.lm_head.weight.size(0)
+            # Memory-efficient cross-entropy: materializing the full (B*T, vocab)
+            # logits for a 100k-vocab model is ~8 GB in fp16 (autocast then casts
+            # them to fp32 for the softmax → ~16 GB) — that alone OOMs a 16 GB
+            # GPU on the first training step. When the full logits would be large
+            # (≥ _CE_CHUNK_MIN_BYTES fp32), apply lm_head + CE in chunks over T:
+            # identical loss (sum over non-padded tokens / their count) with a
+            # one-chunk peak. Small models keep the old path so ``logits`` is
+            # still returned with targets.
+            full_bytes = B * T * V * 4
+            if full_bytes >= _CE_CHUNK_MIN_BYTES:
+                chunk_T = max(1, min(T, _CE_CHUNK_ELEMS // max(1, B * V)))
+                loss_sum = torch.zeros((), device=x.device)  # fp32 accumulator
+                n_valid = 0
+                for s in range(0, T, chunk_T):
+                    e = min(s + chunk_T, T)
+                    tgt = targets[:, s:e].reshape(-1)
+                    chunk_logits = self.lm_head(x[:, s:e]).reshape(-1, V)
+                    loss_sum = loss_sum + F.cross_entropy(
+                        chunk_logits, tgt,
+                        ignore_index=self.config.pad_id, reduction="sum",
+                    )
+                    n_valid += (tgt != self.config.pad_id).sum()
+                loss = loss_sum / n_valid.clamp(min=1)
+                # The full (B, T, V) logits are not materialized here — training
+                # /val callers only consume ``loss`` anyway.
+                logits = None
+            else:
+                logits = self.lm_head(x)
+                loss = F.cross_entropy(
+                    logits.view(-1, V),
+                    targets.view(-1),
+                    ignore_index=self.config.pad_id,
+                )
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
