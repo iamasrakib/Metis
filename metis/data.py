@@ -10,6 +10,7 @@ Professional data pipeline with:
   • Vocabulary statistics and validation
 """
 
+import gc
 import hashlib
 import json
 import logging
@@ -1175,6 +1176,15 @@ def create_dataloaders_from_file(
         tmp_path = cache_path + ".tmp.npy"
         np.save(tmp_path, data)
         os.replace(tmp_path, cache_path)
+        # The fresh array (~2 GB per 500M tokens) was only needed to write the
+        # cache. Drop it and serve train/val from the on-disk read-only memmap
+        # instead, so a 2 GB corpus is NOT held in RAM for the whole run — model
+        # creation and the first checkpoint already need that headroom on Colab.
+        try:
+            data = np.load(cache_path, mmap_mode="r")
+        except (OSError, ValueError, EOFError):
+            pass  # reopen failed right after a successful write — keep in-memory
+        gc.collect()
         logger.info(
             f"Tokenized cache saved: {cache_path} "
             f"({len(data):,} tokens, dtype={data.dtype.name})"

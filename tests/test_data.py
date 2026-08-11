@@ -2,6 +2,7 @@
 Μῆτις (Metis) — Unit Tests for Data Pipeline (BPETokenizer, Datasets)
 """
 
+import gc
 import os
 import sys
 import tempfile
@@ -396,7 +397,13 @@ class TestStreamingTokenizer:
         )
         assert len(tr.dataset) > 0
 
-        # Corrupt every cache file this dataset produced, then reload.
+        # The loaders now serve from the on-disk memmap, which Windows keeps
+        # file-locked — drop them (and the mmap) before corrupting the cache,
+        # mirroring the real scenario: a cache left partial by a *previous*
+        # killed run is encountered fresh on the next run.
+        del tr, va
+        gc.collect()
+
         from metis.data import _cache_path, _file_fingerprint, _tokenizer_cache_name
         cache_path = _cache_path(
             str(p), _tokenizer_cache_name(tok), 8, _file_fingerprint(str(p)),
