@@ -21,6 +21,7 @@ import gc
 import logging
 import math
 import os
+import subprocess
 import time
 
 import torch
@@ -517,6 +518,17 @@ def train(config: ModelConfig, resume: bool = False) -> None:
         logger.info(f"  Device:    {config.device}")
         ddp_status = f"enabled ({ddp_world_size} GPUs)" if config.use_ddp else "disabled"
         logger.info(f"  DDP:       {ddp_status}")
+        # Log the exact code revision so a stale checkout is obvious in the
+        # Colab kernel logs (which don't capture the notebook's own prints).
+        try:
+            _commit = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=os.path.dirname(os.path.dirname(__file__)),
+                stderr=subprocess.DEVNULL, text=True,
+            ).strip()
+        except Exception:
+            _commit = "unknown"
+        logger.info(f"  Commit:    {_commit}")
 
     # ── Reproducibility ───────────────────────────────────────────────────
     torch.manual_seed(config.seed + ddp_rank)
