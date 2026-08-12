@@ -368,7 +368,8 @@ train(config, resume=False)
 | `small` | 256 | 4 | 4 | 256 | ~4M | ~1 GB |
 | `medium` | 384 | 6 | 6 | 512 | ~15M | ~3 GB |
 | `large` | 512 | 8 | 8 | 512 | ~35M | ~6 GB |
-| `1b` | 2048 | 16 | 16 | 1024 | ~1.01B | 16 GB (use `--optimizer bnb8bit`) |
+| `0.5b` | 1536 | 16 | 12 | 1024 | ~0.47B | ~4 GB (bnb8bit) — comfortable on a 16 GB T4 |
+| `1b` | 2048 | 16 | 16 | 1024 | ~1.01B | 16 GB (tight — requires bnb8bit) |
 
 ### CLI Commands
 
@@ -388,7 +389,7 @@ metis train [OPTIONS]
 
 Advanced options:
   --dataset PATH        Path to training text file (default: data/input.txt)
-  --preset NAME         Model preset: tiny / small / medium / large / 1b
+  --preset NAME         Model preset: tiny / small / medium / large / 0.5b / 1b
   --iters N             Max training iterations (default: 5000)
   --lr FLOAT            Peak learning rate (default: 3e-4)
   --batch-size N        Micro batch size (default: 8)
@@ -574,8 +575,9 @@ print(config.summary())
 No GPU at home? The included **`Metis_Colab_Training.ipynb`** trains Metis on Colab's
 free T4 GPU and saves checkpoints straight to your **Google Drive** (a Colab disconnect
 loses nothing). It downloads a **real high-quality corpus — FineWeb-Edu** (HuggingFace's
-educational web corpus, ~500M tokens) and trains the **`1b` preset** with **8-bit Adam**
-(`--optimizer bnb8bit`), which is what fits a ~1B-parameter model in the T4's 16 GB VRAM.
+educational web corpus, ~500M tokens) and trains the **`0.5b` preset** with **8-bit Adam**
+(`--optimizer bnb8bit`). At ~0.47B params it fits the T4's 16 GB with ~10 GB of headroom —
+even if bitsandbytes is unavailable and training falls back to plain AdamW, it still fits.
 
 **Run top to bottom:**
 1. Mount Google Drive.
@@ -583,9 +585,9 @@ educational web corpus, ~500M tokens) and trains the **`1b` preset** with **8-bi
 3. Download FineWeb-Edu (~2 GB text → `MyDrive/Metis/fineweb_edu.txt`). Runs once.
 4. Pick your dataset (defaults to FineWeb-Edu; drop your own `.txt` corpus in Drive to
    override).
-5. Train (`metis train --preset 1b --optimizer bnb8bit --no-cuda-graphs`, 4000 steps ≈
+5. Train (`metis train --preset 0.5b --optimizer bnb8bit --no-cuda-graphs`, 4000 steps ≈
    525M tokens). Checkpoints and the tokenization cache land in
-   `MyDrive/Metis/checkpoints_1b` / `cache`, so **re-running the cell resumes** exactly
+   `MyDrive/Metis/checkpoints_05b` / `cache`, so **re-running the cell resumes** exactly
    where you stopped — across days and sessions.
 
 **Open the notebook — one click:**
@@ -594,11 +596,21 @@ educational web corpus, ~500M tokens) and trains the **`1b` preset** with **8-bi
 Or: Colab → **File → Open notebook → GitHub** → select `iamasrakib/Metis` →
 `Metis_Colab_Training.ipynb`.
 
-**Expectations:** a 1B model runs ~1.5–3k tokens/s on a T4, so 500M tokens takes several
-Colab sessions (re-run the train cell to continue). It will be **data-limited** next to
-production 1B models (which train on 200B+ tokens), but it's a real, coherent model and
-the run resumes indefinitely. Raise `--iters` to train longer; if you hit OOM, lower
-`--batch-size` to 4.
+**Expectations:** the 0.5B model runs ~3–6k tokens/s on a T4 (≈2× a 1B model), so 500M
+tokens takes several Colab sessions (re-run the train cell to continue). It will be
+**data-limited** next to production models (which train on 200B+ tokens), but it's a real,
+coherent model and the run resumes indefinitely. Raise `--iters` to train longer. OOM is
+unlikely on VRAM — the run leaves ~10 GB of the T4's 16 GB free; you can even raise `--batch-size`
+to 4 for more throughput.
+
+**⚠️ RAM OOM (Colab-specific):** Colab's free tier has ~12 GB system RAM. The Phase 6
+async checkpointing (on by default) snapshots the entire model+optimizer+EMA state to
+CPU (~4 GB for 0.5B) and holds it there while the background thread writes to Google
+Drive's slow FUSE mount — this can push RAM over the limit and kill the kernel with **no
+traceback**. The notebook uses `--no-async-checkpoint` (synchronous checkpoint writes)
+which frees the CPU snapshot immediately. If you ever hit a silent Colab kernel death
+during training, check the last `memwatch:` line in the logs — it shows GPU alloc/reserved
++ system RAM, so you can see what the headroom was.
 
 ---
 

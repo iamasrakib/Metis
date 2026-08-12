@@ -595,11 +595,11 @@ class MetisLM(nn.Module):
             ):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
 
-        # Compute parameter count
-        n_params = sum(p.numel() for p in self.parameters())
-        if config.tie_weights:
-            n_params -= self.tok_emb.weight.numel()
-        config.n_params = self._format_params(n_params)
+        # Compute parameter count. With tied embeddings tok_emb.weight and
+        # lm_head.weight are the SAME tensor, and parameters() dedups shared
+        # tensors, so this sum already counts the embedding exactly once.
+        config.n_params = self._format_params(
+            sum(p.numel() for p in self.parameters()))
 
         # Configure the global SDPA kernel flags to match the requested
         # attention backend (see metis/attn.py). No-op on CPU / old torch.

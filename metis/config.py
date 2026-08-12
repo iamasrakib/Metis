@@ -113,6 +113,19 @@ PRESETS = {
         "gradient_accumulation_steps": 16,
         "description": "~1.01B params — needs 16 GB VRAM + --optimizer bnb8bit",
     },
+    "0.5b": {
+        "d_model": 1536,
+        "n_heads": 16,
+        "n_kv_heads": 8,
+        "n_layers": 12,
+        "max_seq_len": 1024,
+        "learning_rate": 2e-4,
+        "warmup_steps": 1000,
+        "micro_batch_size": 8,
+        "gradient_accumulation_steps": 16,
+        "description": "~0.47B params (GQA) — fits a 16 GB T4 even with the "
+        "plain-AdamW fallback (~4 GB w/ bnb8bit, ~6.8 GB worst case)",
+    },
 }
 
 
